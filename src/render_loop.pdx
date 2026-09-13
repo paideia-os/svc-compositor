@@ -1,0 +1,415 @@
+// src/render_loop.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M2-003 / #6)
+// RenderLoop module: 60 Hz render loop over HPET
+// (sys_clock_read_ns, sysno 66).
+//
+// ================================================================
+// Scope (per issue #6 / design/graphics/r102-user-plan.md §4.4
+// R102.M2-003, §5.5)
+// ================================================================
+//
+// Each tick: read the monotonic clock (sys_clock_read_ns, sysno 66,
+// HPET-backed per design/user/syscall-table.md row 66), busy-wait
+// until at least 16_666_666 ns (60 Hz best-effort period) have
+// elapsed since the previous tick, drain every dirty surface's
+// pending damage into the scanout buffer via Scanout.scanout_blit_rect
+// (src/scanout.pdx, #4), and emit a PresentRecord@0.1-shaped summary.
+//
+// "Drain placement queue" (per the design doc's fuller M2-003 scope)
+// is NOT exercised here: the placement queue is WM_PLACE_WINDOW
+// traffic against the real window row-store, which per window_table.pdx
+// (#5) and commit.pdx (#7)'s own header remains deferred pending
+// SUBSCRIBE_WINDOW's active accept-loop body. What IS real and wired
+// end-to-end at this closer is the damage-drain path: commit.pdx's
+// per-surface damage table (landed alongside this closer, #7) is
+// walked every tick, every dirty slot is blitted, and the slot is
+// cleared -- an honest subset of the full M2-003 scope, matching this
+// repo's established "land what the upstream substrate actually
+// supports today" discipline (see window_table.pdx / query_surface.pdx
+// / screenshot_query.pdx's own "active body deferred" notes).
+//
+// ---- PresentRecord@0.1 (§5.5), as emitted here ----
+//
+//   +0  tick_id             u64  monotonic tick counter
+//   +8  scanout_id          u64  0 (single scanout at M2)
+//   +16 windows_composited  u64  count of surfaces blitted this tick
+//   +24 damaged_pixels      u64  sum of w*h over blitted surfaces
+//   +32 frame_duration_ns   u64  wall-clock time since previous tick
+//   +40 target_period_ns    u64  16_666_666 (nominal 60 Hz period)
+//   +48 slipped             u64  1 if frame_duration_ns > target, else 0
+//   +56 ts_ns               u64  wall-clock ns at emission (lo half;
+//                                 the spec's i128 width is not needed
+//                                 at M2 -- ns-since-boot is always
+//                                 non-negative and fits u64 for
+//                                 centuries; full i128 storage is
+//                                 deferred to whichever future closer
+//                                 actually needs a signed epoch)
+//
+//   total: 64 bytes (spec's `windows_composited: u16` and `slipped:
+//   bool` are each widened to a full u64 field here so every field
+//   is a plain 8-byte store -- no sub-word packing inside the record
+//   itself; this is a superset-shaped, not a narrower, landing).
+//
+// ================================================================
+// Entry points
+// ================================================================
+//
+//   * render_loop_init() -> u64
+//       Seeds _rl_last_tick_ns from the current clock and zeroes
+//       _rl_tick_id. Always returns 0.
+//
+//   * render_loop_wait_frame() -> u64
+//       Busy-waits (repeated sys_clock_read_ns) until at least
+//       16_666_666 ns have elapsed since _rl_last_tick_ns, publishes
+//       the new timestamp, and returns the elapsed delta in ns.
+//
+//   * compositor_render_frame() -> u64
+//       Walks Commit's 256-slot damage table (src/commit.pdx, #7);
+//       for each dirty slot, calls Scanout.scanout_blit_rect with a
+//       tightly-packed src_pitch (w*4 bytes -- BGRA8888, no padding
+//       assumed on the client's committed buffer) and clears the
+//       slot. Returns windows_composited (low 32 bits) packed with
+//       damaged_pixels (high 32 bits) in rax.
+//
+//   * render_loop_present(windows, pixels, frame_duration_ns) -> u64
+//       Bumps _rl_tick_id, computes `slipped`, reads a fresh
+//       timestamp, and writes the 64-byte PresentRecord into
+//       _rl_last_present. Always returns 0.
+//
+//   * render_loop_tick() -> u64
+//       One full iteration: wait_frame -> render_frame -> present.
+//       Always returns 0.
+//
+//   * render_loop_run(n_ticks) -> u64
+//       Calls render_loop_init once, then render_loop_tick n_ticks
+//       times. Returns the number of ticks executed (== n_ticks).
+//       Bounded entry point for boot-witness / probe use; the
+//       service's real main loop calls render_loop_init once at
+//       startup and render_loop_tick in an unbounded loop (that
+//       wiring lands with main.pdx, out of this closer's scope).
+//
+// ================================================================
+// paideia-as compliance
+// ================================================================
+//   - Module RenderLoop (PascalCase of render_loop.pdx stem).
+//   - No `test rN, rN`; no `and rN, imm64`; no 2-op `imul r, imm`
+//     (the one multiply, w*h pixel-count, is `imul r15, rax` reg,reg).
+//   - No `add reg, [mem]` -- every memory operand staged through a
+//     register first.
+//   - No function here takes more than 3 curried arguments.
+//   - Every value that must survive a bare `syscall` instruction is
+//     held in a callee-save register (r12-r15/rbx) or re-derived from
+//     memory afterward -- this file treats `syscall` conservatively,
+//     as clobbering every caller-save register (rax/rcx/rdx/rsi/rdi/
+//     r8-r11), matching the safest reading of the SysV syscall
+//     convention (the instruction itself only guarantees rcx/r11/rax
+//     are overwritten, but nothing here relies on more surviving).
+//   - Reserved-label discipline: every label prefixed `rl_`.
+//   - Module-let constants used in cmp/mov are inlined as literals
+//     (16666666 / 256 appear as literals with a naming comment).
+//
+// ================================================================
+// External symbols (cross-file, resolved at link time -- same
+// convention the kernel tree uses, e.g. scanout.pdx -> z_order.pdx)
+// ================================================================
+//   * _cmt_damage_table   (src/commit.pdx)   -- per-surface damage slots
+//   * scanout_blit_rect   (src/scanout.pdx)  -- rect blit into the LFB
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M2-003, §5.5
+// (paideia-os monorepo); design/user/syscall-table.md row 66
+// (sys_clock_read_ns); this repo's #6.
+
+module RenderLoop = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  pub let RL_OK               : u64 = 0
+  pub let RL_FRAME_PERIOD_NS  : u64 = 16666666       // 60 Hz best-effort
+
+  // ==========================================================================
+  // State
+  // ==========================================================================
+
+  pub let mut _rl_last_tick_ns  : u64        = uninit @align(8)
+  pub let mut _rl_tick_id       : u64        = uninit @align(8)
+  pub let mut _rl_last_present  : [u64; 8]   = uninit @align(64)   // PresentRecord@0.1, 64 B
+
+  // ==========================================================================
+  // render_loop_init() -> u64
+  // ==========================================================================
+
+  pub let render_loop_init : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R102.M2-003 (#6): RenderLoop::render_loop_init. rax=66 (SC+ ID sys_clock_read_ns); syscall; publish rax to _rl_last_tick_ns; zero _rl_tick_id. Leaf, no push (nothing needs to survive the syscall except the return value itself, staged directly from rax into memory). No test/and/imul/add-reg-mem. Labels: none (straight-line).",
+      block: {
+        mov rax, 66;                         // SC+ ID 66 = sys_clock_read_ns
+        syscall;
+
+        lea r10, [rip + _rl_last_tick_ns];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _rl_tick_id];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+
+        xor rax, rax;                        // RL_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // render_loop_wait_frame() -> u64
+  //
+  // Busy-wait loop: re-reads the clock every iteration and re-reads
+  // _rl_last_tick_ns from memory every iteration (rather than keeping
+  // either live across the repeated `syscall`), so no register needs
+  // to survive the syscall at all. Returns the elapsed delta in ns.
+  // ==========================================================================
+
+  pub let render_loop_wait_frame : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R102.M2-003 (#6): RenderLoop::render_loop_wait_frame. Loop body: rax=66; syscall -> rax=now_ns; stash in r10 (caller-save, safe -- no further syscall/call before use); reload _rl_last_tick_ns into rax via rip-relative load; r9 = now_ns - last (reg,reg sub); compare against the literal 16666666 (RL_FRAME_PERIOD_NS, inlined per encoder discipline) via r8; `jb` back to the top while under-period. On exit, publish now_ns (r10) as the new _rl_last_tick_ns and return the delta (r9) in rax. No register is asked to survive the syscall except via memory (last_tick_ns) or a callee-independent single-use caller-save reg (r10, r9, r8) reloaded fresh every iteration -- conservative w.r.t. what a raw `syscall` instruction actually clobbers. Labels prefixed rl_.",
+      block: {
+      rl_wait_top:
+        mov rax, 66;
+        syscall;
+        mov r10, rax;                        // r10 = now_ns
+
+        lea r11, [rip + _rl_last_tick_ns];
+        mov rax, [r11 + 0];                  // rax = last_tick_ns
+        mov r9, r10;
+        sub r9, rax;                         // r9 = delta = now - last
+
+        mov r8, 16666666;                    // RL_FRAME_PERIOD_NS (literal)
+        cmp r9, r8;
+        jb  rl_wait_top;
+
+        mov [r11 + 0], r10;                  // publish new last_tick_ns
+
+        mov rax, r9;                         // return delta
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // compositor_render_frame() -> u64
+  //
+  // Walks Commit's 256-slot damage table. Dirty slot -> blit + clear.
+  // Returns windows_composited | (damaged_pixels << 32) in rax.
+  //
+  // Register plan: 4 callee-save pushes (r12=loop index i, r13=windows
+  // accumulator, r14=pixels accumulator, r15=per-iteration w*h,
+  // survives the scanout_blit_rect call) = 32 B; this function makes
+  // one nested call per dirty slot, so every value that must survive
+  // it lives in a callee-save register (SysV guarantees
+  // scanout_blit_rect preserves rbx/r12-r15/rbp). Labels prefixed rl_.
+  // ==========================================================================
+
+  pub let compositor_render_frame : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R102.M2-003 (#6): RenderLoop::compositor_render_frame. Iterates surface_id i in [0,256) (256 = SCC_MAX_WINDOWS, duplicated as a literal per encoder discipline). Per slot: load dirty_flag at _cmt_damage_table[i*4+0] (external symbol, src/commit.pdx / #7); if 0, skip. If dirty: load xy/wh (fields +8/+16) into rdi/rsi (scanout_blit_rect's first two args), compute pixel count w*h into r15 (`mov eax,esi` zero-extend low32=w, `mov rax,rsi;shr rax,32`=h, `imul r15,rax` reg,reg), compute src_pitch=w*4 into rcx (arg4), load buffer_ptr (field +24) into rdx (arg3), call scanout_blit_rect(xy,wh,buffer_ptr,src_pitch). After return, re-derive the slot address (rax/r10/r11 are caller-save and may have been clobbered by the callee) and clear dirty_flag to 0; bump r13 (windows_composited) and r14 (damaged_pixels += r15, r15 having survived the call in a callee-save register). Pack the return value as windows (low32) | pixels<<32 via `shl rax,32; or rax,r13`. 4 callee-save pushes (r12=i, r13=windows, r14=pixels, r15=per-iter w*h) satisfy SysV's callee-save contract across the nested call. Labels prefixed rl_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        xor r12, r12;                        // i = 0
+        xor r13, r13;                        // windows_composited = 0
+        xor r14, r14;                        // damaged_pixels = 0
+
+      rl_frame_loop:
+        cmp r12, 256;                        // SCC_MAX_WINDOWS (literal)
+        jae rl_frame_done;
+
+        mov r10, r12;
+        shl r10, 2;                          // r10 = u64-index of slot
+        lea r11, [rip + _cmt_damage_table];
+        mov rax, [r11 + r10*8 + 0];          // dirty_flag
+        cmp rax, 0;
+        je  rl_frame_next;
+
+        mov rdi, [r11 + r10*8 + 8];          // xy
+        mov rsi, [r11 + r10*8 + 16];         // wh
+
+        mov eax, esi;                        // eax = w (zero-extend)
+        mov r15, rax;
+        mov rax, rsi;
+        shr rax, 32;                         // rax = h
+        imul r15, rax;                       // r15 = w*h (reg,reg imul)
+
+        mov eax, esi;                        // recompute w for pitch
+        shl rax, 2;                          // src_pitch = w*4
+        mov rcx, rax;
+
+        mov rdx, [r11 + r10*8 + 24];         // buffer_ptr
+
+        call scanout_blit_rect;
+
+        // Clear dirty_flag (re-derive slot addr; rax/r10/r11 caller-save).
+        mov r10, r12;
+        shl r10, 2;
+        lea r11, [rip + _cmt_damage_table];
+        xor rax, rax;
+        mov [r11 + r10*8 + 0], rax;
+
+        add r13, 1;                          // windows_composited++
+        add r14, r15;                        // damaged_pixels += w*h
+
+      rl_frame_next:
+        add r12, 1;
+        jmp rl_frame_loop;
+
+      rl_frame_done:
+        mov rax, r14;
+        shl rax, 32;
+        or  rax, r13;                        // rax = windows | (pixels << 32)
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // render_loop_present(windows, pixels, frame_duration_ns) -> u64
+  //
+  // Bumps _rl_tick_id, computes slipped, reads a fresh timestamp, and
+  // writes the 64-byte PresentRecord.
+  //
+  // Register plan: 5 callee-save pushes (r12=windows, r13=pixels,
+  // r14=frame_duration_ns, r15=new tick_id, rbx=slipped) so every arg
+  // and every derived value survives the trailing `syscall`
+  // (conservatively treated as clobbering all caller-save registers).
+  // Labels prefixed rl_.
+  // ==========================================================================
+
+  pub let render_loop_present : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (windows: u64) (pixels: u64) (frame_duration_ns: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R102.M2-003 (#6): RenderLoop::render_loop_present. Stashes the 3 args into r12/r13/r14 (callee-save) before doing anything else. Bumps _rl_tick_id (load, add 1, store, keep new value in r15). Computes slipped (rbx) = frame_duration_ns > 16666666 ? 1 : 0 via cmp+jbe (literal, RL_FRAME_PERIOD_NS). Issues rax=66;syscall for a fresh timestamp -- taken AFTER windows/pixels/frame_duration_ns/tick_id/slipped are all parked in callee-save registers, so the syscall's conservative caller-save clobber cannot lose any of them; ts_ns is read from rax immediately into r10 post-syscall. Writes the 64-byte PresentRecord (_rl_last_present) field-by-field via 8 straight-line `mov [r11+off], reg` stores. 5 callee-save pushes (r12/r13/r14/r15/rbx) precede the one nested `syscall`; SysV guarantees these survive any real CALL too, so the discipline generalizes if a future closer replaces the raw syscall with a wrapped clock_read_ns() call. Labels prefixed rl_ (rl_present_no_slip only).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbx;
+
+        mov r12, rdi;                        // windows
+        mov r13, rsi;                        // pixels
+        mov r14, rdx;                        // frame_duration_ns
+
+        lea r10, [rip + _rl_tick_id];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+        mov r15, rax;                        // r15 = new tick_id
+
+        mov r10, 16666666;                   // RL_FRAME_PERIOD_NS (literal)
+        xor rbx, rbx;                        // slipped = 0
+        cmp r14, r10;
+        jbe rl_present_no_slip;
+        mov rbx, 1;
+      rl_present_no_slip:
+
+        mov rax, 66;                         // sys_clock_read_ns
+        syscall;
+        mov r10, rax;                        // r10 = ts_ns
+
+        lea r11, [rip + _rl_last_present];
+        mov [r11 + 0], r15;                  // tick_id
+        xor rax, rax;
+        mov [r11 + 8], rax;                  // scanout_id = 0
+        mov [r11 + 16], r12;                 // windows_composited
+        mov [r11 + 24], r13;                 // damaged_pixels
+        mov [r11 + 32], r14;                 // frame_duration_ns
+        mov rax, 16666666;
+        mov [r11 + 40], rax;                 // target_period_ns
+        mov [r11 + 48], rbx;                 // slipped
+        mov [r11 + 56], r10;                 // ts_ns (u64 lo)
+
+        xor rax, rax;                        // RL_OK
+        pop rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // render_loop_tick() -> u64
+  // ==========================================================================
+
+  pub let render_loop_tick : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R102.M2-003 (#6): RenderLoop::render_loop_tick. One full iteration: call render_loop_wait_frame (rax = frame_duration_ns, stashed in r12); call compositor_render_frame (rax = packed windows|pixels<<32, stashed in r13); unpack via `mov eax,r13d` (windows, zero-extend) / `mov rax,r13;shr rax,32` (pixels); call render_loop_present(windows, pixels, frame_duration_ns). 2 callee-save pushes (r12, r13) survive the two nested calls per SysV. Labels: none needed (straight-line).",
+      block: {
+        push r12;
+        push r13;
+
+        call render_loop_wait_frame;
+        mov r12, rax;                        // frame_duration_ns
+
+        call compositor_render_frame;
+        mov r13, rax;                        // packed windows|pixels<<32
+
+        mov eax, r13d;                       // rax = windows (zero-extend low32)
+        mov rdi, rax;
+        mov rax, r13;
+        shr rax, 32;                         // rax = pixels
+        mov rsi, rax;
+        mov rdx, r12;                        // frame_duration_ns
+
+        call render_loop_present;
+
+        xor rax, rax;                        // RL_OK
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // render_loop_run(n_ticks) -> u64
+  // ==========================================================================
+
+  pub let render_loop_run : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (n_ticks: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R102.M2-003 (#6): RenderLoop::render_loop_run. Bounded driver for boot-witness / probe use: calls render_loop_init once, then render_loop_tick n_ticks times, returning the count executed. 2 callee-save pushes (r12=n_ticks, r13=loop counter i) survive the nested calls. Labels prefixed rl_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                        // n_ticks
+
+        call render_loop_init;
+
+        xor r13, r13;                        // i = 0
+      rl_run_loop:
+        cmp r13, r12;
+        jae rl_run_done;
+
+        call render_loop_tick;
+
+        add r13, 1;
+        jmp rl_run_loop;
+
+      rl_run_done:
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+}

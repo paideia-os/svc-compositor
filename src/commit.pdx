@@ -1,0 +1,181 @@
+// src/commit.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M2-004 / #7)
+// Commit module: COMMIT_SURFACE handler.
+//
+// ================================================================
+// Scope (per issue #7 / design/graphics/r102-user-plan.md §4.4
+// R102.M2-004)
+// ================================================================
+//
+// On COMMIT_SURFACE, look up the client's window row, merge the
+// delivered damage into a per-surface damage slot, and mark the
+// surface as needing recomposite on the render loop's next tick. The
+// design doc's own scope note explicitly defers the actual blit to
+// the render loop ("Actual blit deferred to render loop's next
+// tick.") -- that dispatch is R102.M2-003 / #6 (src/render_loop.pdx).
+//
+// ---- Message shape (as delivered by the accept loop's IPC recv) ----
+//
+//   +0  kind        u32   SCC_REQ_COMMIT_SURFACE (0x02)
+//   +4  surface_id  u32
+//   +8  x           u16
+//   +10 y           u16
+//   +12 w           u16
+//   +14 h           u16
+//   +16 buffer_ptr  u64   client-committed pixel buffer (BGRA8888)
+//
+//   total: 24 bytes.
+//
+// NOTE on the wire ordinal: the dispatch brief that seeded this
+// closer named `kind:u32=0x11` for COMMIT_SURFACE, but 0x11 is
+// already the FROZEN ordinal for WM_SET_FOCUS
+// (src/wire_protocol.pdx's SCC_REQ_WM_SET_FOCUS, caps.decl's
+// `request.WM_SET_FOCUS = 0x11`, both landed at v1.1.0 / #2).
+// COMMIT_SURFACE's own frozen ordinal is 0x02
+// (SCC_REQ_COMMIT_SURFACE). This handler gates on 0x02 -- the
+// value the already-shipped, cross-referenced wire protocol commits
+// to -- rather than reproducing the brief's typo and silently
+// colliding two request kinds on one wire value.
+//
+// ================================================================
+// Per-surface damage table (this closer's own storage)
+// ================================================================
+//
+// window_table.pdx (#5, frozen at v1.1.0) defines the window-ROW
+// struct layout as pure `pub let` offset constants only -- no row
+// storage is actually allocated yet (that landing's own note: "Active
+// row-store + sort passes deferred ... need paideia-os pdxclock
+// M2-002 HPET substrate", which THIS wave's #6 supplies). Rather than
+// mutate the frozen M2-002 substrate file to bolt on storage it does
+// not yet own, this closer owns a small, self-contained
+// surface-indexed damage table sized to the same SCC_MAX_WINDOWS
+// bound (256, duplicated here per the module-let-constants-must-be-
+// literals encoder discipline) that #6's render loop reads and
+// drains every tick. Each 32-byte, 8-byte-aligned slot:
+//
+//   +0  dirty_flag   u64   0 = clean, 1 = needs recomposite
+//   +8  xy           u64   x | (y << 32) -- matches Scanout's packed
+//                          coordinate convention (src/scanout.pdx)
+//   +16 wh           u64   w | (h << 32)
+//   +24 buffer_ptr   u64   client buffer to blit from
+//
+// A future closer that lands the real window row-store (once
+// SUBSCRIBE_WINDOW's active accept-loop body exists) should reconcile
+// this table with WindowTable's row layout -- e.g. by folding
+// dirty_flag/xy/wh into the row's damage_ring fields -- rather than
+// keeping two parallel per-surface stores; noted in STATUS.md.
+//
+// ================================================================
+// paideia-as compliance
+// ================================================================
+//   - Module Commit (PascalCase of commit.pdx stem).
+//   - No `test rN, rN`; no `and rN, imm64`; no 2-op `imul r, imm`
+//     (no multiply in this file); no byte-register alias (u16 fields
+//     read via `mov_w`, zero-extending).
+//   - No `add reg, [mem]` -- every memory operand staged through a
+//     register first.
+//   - `[reg + reg*8 + disp]` triple-form addressing proven at
+//     fs/fd_table.pdx L22/L36/L54.
+//   - Reserved-label discipline: labels prefixed `cmt_`.
+//   - commit_surface_handle takes exactly 1 argument (msg_ptr), well
+//     under the 4-curried-arg ceiling.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M2-004
+// (paideia-os monorepo); this repo's #7; src/wire_protocol.pdx (#2)
+// for the frozen SCC_REQ_COMMIT_SURFACE ordinal; src/scanout.pdx (#4)
+// for the packed xy/wh convention this table's slots mirror.
+
+module Commit = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  pub let CMT_OK               : u64 = 0
+  pub let CMT_ERR_BAD_KIND     : u64 = 0xFFFFFFFFFFFFFFFE
+  pub let CMT_ERR_BAD_SURFACE  : u64 = 0xFFFFFFFFFFFFFFFD
+
+  // ==========================================================================
+  // State -- per-surface damage table, 256 slots * 4 u64 fields.
+  // Read + drained by src/render_loop.pdx's compositor_render_frame
+  // (cross-file symbol reference, same convention the kernel tree
+  // uses for e.g. scanout.pdx's reference to z_order.pdx's
+  // _z_stack_count).
+  // ==========================================================================
+
+  pub let mut _cmt_damage_table : [u64; 1024] = uninit @align(64)
+
+  // ==========================================================================
+  // commit_surface_handle(msg_ptr) -> u64
+  //
+  // Parses the 24-byte COMMIT_SURFACE message at msg_ptr and latches
+  // it into _cmt_damage_table[surface_id]. Gate order:
+  //   (1) kind != 0x02 (SCC_REQ_COMMIT_SURFACE)     -> CMT_ERR_BAD_KIND
+  //   (2) surface_id >= 256 (SCC_MAX_WINDOWS bound) -> CMT_ERR_BAD_SURFACE
+  //   (3) latch dirty_flag=1, xy, wh, buffer_ptr    -> CMT_OK
+  //
+  // Register plan: 2 callee-save pushes (r12 = surface_id, r13 = the
+  // u64-index of the slot's first field) = 16 B; this function makes
+  // no nested call, so alignment is a non-issue -- the pushes exist
+  // purely to free rax/r8-r11 for the field-unpack arithmetic without
+  // re-deriving surface_id twice. Labels prefixed cmt_.
+  // ==========================================================================
+
+  pub let commit_surface_handle : (u64) -> u64 !{mem} @{} =
+    fn (msg_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R102.M2-004 (#7): Commit::commit_surface_handle. Reads kind (u32 @ +0, `mov eax,[rdi+0]` zero-extend), gates on the FROZEN SCC_REQ_COMMIT_SURFACE=0x02 ordinal (src/wire_protocol.pdx / caps.decl, not the dispatch brief's 0x11 typo -- see file header). Reads surface_id (u32 @ +4), gates against the SCC_MAX_WINDOWS=256 bound (window_table.pdx's frozen constant, duplicated here as a literal per encoder discipline). Reads x/y/w/h (u16 @ +8/+10/+12/+14 via `mov_w`, zero-extending) and packs xy=x|(y<<32), wh=w|(h<<32) via `shl r64,32` + `or r64,r64` (both proven idioms -- shl-by-32 at pdxfs_lite/uuid.pdx L75/L83, or at graphics/scanout.pdx's bitmap-set path). Reads buffer_ptr (u64 @ +16) verbatim -- never dereferenced here, only stored, so an arbitrary/garbage client pointer cannot fault this handler (the eventual blit that dereferences it runs later, in render_loop.pdx's compositor_render_frame, against a real committed value). Computes the table slot's u64-index as surface_id*4 via `shl r13,2` (register,immediate shift, not a multiply) and writes the 4 fields via `[r11 + r13*8 + disp]` triple-form SIB addressing (proven: fs/fd_table.pdx L22/L36/L54). 2 callee-save pushes (r12=surface_id, r13=slot index); no nested call, so alignment is inapplicable. Labels prefixed cmt_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov eax, [rdi + 0];                  // kind (u32, zero-extended)
+        cmp rax, 2;                          // SCC_REQ_COMMIT_SURFACE (frozen)
+        jne cmt_bad_kind;
+
+        mov eax, [rdi + 4];                  // surface_id (u32, zero-extended)
+        cmp rax, 256;                        // SCC_MAX_WINDOWS bound
+        jae cmt_bad_surface;
+        mov r12, rax;                        // r12 = surface_id
+
+        mov_w rax, [rdi + 8];                // x
+        mov r8, rax;
+        mov_w rax, [rdi + 10];               // y
+        shl rax, 32;
+        or  r8, rax;                         // r8 = xy
+
+        mov_w rax, [rdi + 12];               // w
+        mov r9, rax;
+        mov_w rax, [rdi + 14];               // h
+        shl rax, 32;
+        or  r9, rax;                         // r9 = wh
+
+        mov r10, [rdi + 16];                 // buffer_ptr
+
+        mov r13, r12;
+        shl r13, 2;                          // r13 = u64-index of slot (surface_id*4)
+
+        lea r11, [rip + _cmt_damage_table];
+        mov rax, 1;
+        mov [r11 + r13*8 + 0], rax;          // dirty_flag = 1
+        mov [r11 + r13*8 + 8], r8;           // xy
+        mov [r11 + r13*8 + 16], r9;          // wh
+        mov [r11 + r13*8 + 24], r10;         // buffer_ptr
+
+        xor rax, rax;                        // CMT_OK
+        jmp cmt_out;
+
+      cmt_bad_kind:
+        mov rax, 0xFFFFFFFFFFFFFFFE;         // CMT_ERR_BAD_KIND
+        jmp cmt_out;
+
+      cmt_bad_surface:
+        mov rax, 0xFFFFFFFFFFFFFFFD;         // CMT_ERR_BAD_SURFACE
+
+      cmt_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+}

@@ -1,4 +1,6 @@
-# caps.decl -- svc-compositor v1.1.0 (Wave Y drain: R102.M1-002 / #2)
+# caps.decl -- svc-compositor v1.2.0 (Wave PP: R102.M1-001 scaffold
+# closure / #1, adding the M1-001 cap-kind enumeration alongside the
+# frozen R102.M1-002 wire protocol below)
 #
 # Capability declaration for the compositor service.
 #
@@ -26,6 +28,37 @@ protocol.version     = R102-v0
 #   revokes on exit. Stub-declared here at M1-002; the real cap wire
 #   lands at M3-001 (#8).
 cap.holds            = KIND_FB_SCANOUT
+
+# ------------------------------------------------------------------
+# Capability kinds this service REFERENCES (M1-001 scaffold closure,
+# Wave PP / #1)
+# ------------------------------------------------------------------
+# These four are consulted (borrowed, minted-elsewhere, or read) but
+# not held outright the way KIND_FB_SCANOUT is -- named here so a
+# future caps.decl linter checking "every kind this service touches
+# has an anchor" has one, and so downstream satellites (svc-wm,
+# libpdx-gfx, libpdx-event) can grep this file for the compositor's
+# full capability surface rather than just its held kind.
+#
+# KIND_USER: caller identity cap threaded through every client-facing
+#   request (SUBSCRIBE_WINDOW, COMMIT_SURFACE, the four QUERY_* ops).
+#   svc_broker mints and revokes; the compositor never holds one
+#   itself, only reads the identity a request arrives tagged with.
+cap.uses             = KIND_USER
+# KIND_IPC_ENDPOINT: the underlying kind of every endpoint.register
+#   line below (client/wm/broker/query).
+cap.uses             = KIND_IPC_ENDPOINT
+# KIND_SURFACE: client-owned pixel-buffer cap COMMIT_SURFACE borrows
+#   (never holds) to read committed damage bytes from -- libpdx-gfx's
+#   real mint (design/graphics/r102-user-plan.md §7.2.1 sibling).
+#   M2-004 (#7) borrows the raw buffer pointer the client hands over
+#   in its COMMIT_SURFACE message; the cap-checked borrow path lands
+#   once libpdx-gfx.M3-001 mints real KIND_SURFACE caps.
+cap.uses             = KIND_SURFACE
+# KIND_INPUT_EVENT: materialized HID event object the M3-002 input
+#   pump (#9, not in this wave) forwards to the focused window's
+#   subscribed client.
+cap.uses             = KIND_INPUT_EVENT
 
 # ------------------------------------------------------------------
 # IPC endpoints this service REGISTERS on svc_broker

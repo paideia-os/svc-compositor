@@ -1,0 +1,66 @@
+// tests/probe_fb_scanout_cap.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M3-001 / #8)
+// ProbeFbScanoutCap: real-body witness for the KIND_FB_SCANOUT cap
+// query closer. Calls kind_fb_scanout_query against cap_id=0 (whose
+// backing content this process cannot predict -- see file header of
+// src/fb_scanout_cap.pdx) and asserts only what is deterministic
+// regardless of that outcome: the return status is one of the two
+// documented values, and pitch/dims are always the WEAK-stub values.
+//
+// paideia-as encoder notes: identical syscall shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_fbs_`.
+
+module ProbeFbScanoutCap = structure {
+
+  pub let probe_fbs_fp     : [u8; 35] = "svc-compositor kind-fb-scanout ok\n\0"
+  pub let probe_fbs_fp_len : u64      = 34
+
+  pub let mut _probe_fbs_out_ptr   : u64 = uninit @align(8)
+  pub let mut _probe_fbs_out_pitch : u64 = uninit @align(8)
+  pub let mut _probe_fbs_out_dims  : u64 = uninit @align(8)
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M3-001 (#8): ProbeFbScanoutCap::run. Calls kind_fb_scanout_query(cap_id=0, &_probe_fbs_out_ptr, &_probe_fbs_out_pitch, &_probe_fbs_out_dims) (external symbol, src/fb_scanout_cap.pdx). cap_id=0's backing content in the shared kernel cap_table is not something this probe can predict (single shared table, per design/audit/entries/b5-004-cap-invoke.md), so it asserts only `rax <= 1` (FBS_RESULT_REAL_PTR=0 or FBS_RESULT_WEAK_STUB=1 -- via `cmp rax,1; ja probe_fbs_fail`, unsigned-above) rather than a specific value. Re-reads _probe_fbs_out_pitch and asserts it equals 7680, and _probe_fbs_out_dims and asserts it equals 1920|(1080<<32) -- both are WEAK-stubbed unconditionally by kind_fb_scanout_query regardless of the pointer outcome, so these two checks ARE deterministic. Only then emits the fingerprint via sys_write. Any assertion failure short-circuits to probe_fbs_fail (rax=1, no fingerprint emitted). No test rN,rN; no and rN,imm64; no byte-register mov. Labels prefixed probe_fbs_.",
+      block: {
+        xor rdi, rdi;                        // cap_id = 0
+        lea rsi, [rip + _probe_fbs_out_ptr];
+        lea rdx, [rip + _probe_fbs_out_pitch];
+        lea rcx, [rip + _probe_fbs_out_dims];
+        call kind_fb_scanout_query;
+        cmp rax, 1;
+        ja  probe_fbs_fail;
+
+        lea r10, [rip + _probe_fbs_out_pitch];
+        mov rax, [r10 + 0];
+        cmp rax, 7680;
+        jne probe_fbs_fail;
+
+        lea r10, [rip + _probe_fbs_out_dims];
+        mov rax, [r10 + 0];
+        mov r8, 1080;
+        shl r8, 32;
+        mov r9, 1920;
+        or  r9, r8;
+        cmp rax, r9;
+        jne probe_fbs_fail;
+
+        mov rdi, 1;
+        lea rsi, [rip + probe_fbs_fp];
+        mov rdx, 34;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_fbs_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_fbs_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

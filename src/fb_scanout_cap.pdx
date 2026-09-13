@@ -1,0 +1,157 @@
+// src/fb_scanout_cap.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M3-001 / #8)
+// FbScanoutCap module: real KIND_FB_SCANOUT cap query, WEAK-stub
+// where the kind itself is not yet allocated.
+//
+// ================================================================
+// Scope (per issue #8 / design/graphics/r102-user-plan.md §4.4
+// R102.M3-001, §7.2.1)
+// ================================================================
+//
+// §7.2.1 asks osarch for a `KIND_FB_SCANOUT` cap kind with `PRESENT`
+// / `QUERY_GEOMETRY` / `REVOKE` ops. As of this closer that kind's
+// ordinal is explicitly "reserved by osarch" but NOT minted --
+// design/user/syscall-table.md and design/capabilities/phase1-api.md
+// name no KIND_FB_SCANOUT anywhere, and no per-kind cap_invoke
+// dispatch exists for it (design/audit/entries/b5-004-cap-invoke.md
+// documents cap_invoke's MVP as kind-agnostic: it reads
+// descriptor.target_ptr and returns it verbatim, regardless of
+// descriptor.kind -- see that audit's §"Known Limitations": "no
+// per-kind dispatch ... deferred to Phase 7+"). What DOES exist today
+// is the generic `sys_cap_invoke(slot, op_arg)` syscall itself
+// (sysno 4, design/user/syscall-table.md row 45, landed under B5-004)
+// -- a real, callable syscall.
+//
+// `kind_fb_scanout_query` below therefore issues the real
+// `sys_cap_invoke` syscall for the scanout base pointer (best-effort:
+// if the caller's cap slot resolves to something, that pointer is
+// returned; if it does not -- INVALID_HANDLE or an empty/zero slot,
+// which is the only possible outcome today since no loader hands the
+// compositor a real FB_SCANOUT cap slot yet -- the function falls
+// back to the same WEAK-stub sentinel pointer src/scanout.pdx's
+// scanout_init uses). The pitch/dims outputs are ALWAYS WEAK-stubbed:
+// cap_invoke's MVP returns one u64 (target_ptr), not a structured
+// geometry record, so there is no wire today over which a real pitch
+// or dims value could travel even on a fully successful invoke. This
+// is documented rather than silently faked: the return value flags
+// which posture applied.
+//
+// ================================================================
+// Entry point
+// ================================================================
+//
+//   kind_fb_scanout_query(cap_id, out_lfb_ptr, out_pitch, out_dims) -> u64
+//
+//     out_lfb_ptr, out_pitch, out_dims are OUT pointers into the
+//     caller's own address space (same-privilege, same-process --
+//     no KPTI walker needed, unlike a kernel syscall handler writing
+//     to a ring-3 pointer).
+//
+//     *out_lfb_ptr <- sys_cap_invoke(cap_id, FBS_OP_QUERY_GEOMETRY)'s
+//                     result, or the WEAK-stub sentinel
+//                     (0xFFFFF00000000000, matching scanout.pdx) if
+//                     that result is 0 or INVALID_HANDLE
+//                     (0xFFFFFFFFFFFFFFFE).
+//     *out_pitch    <- 7680 (WEAK-stub, always -- see above).
+//     *out_dims     <- 1920 | (1080 << 32) (WEAK-stub, always).
+//
+//     Returns 1 if the WEAK-stub pointer fallback fired (cap_id did
+//     not resolve to a live descriptor), 0 if a real pointer was
+//     returned from cap_invoke (pitch/dims are STILL WEAK-stub in
+//     this case -- 0 means "pointer real", not "record real").
+//
+// Exactly 4 curried args -- at the paideia-as ceiling.
+//
+// ================================================================
+// paideia-as compliance
+// ================================================================
+//   - Module FbScanoutCap (PascalCase of fb_scanout_cap.pdx stem).
+//   - No `test rN, rN`; no `and rN, imm64`; no 2-op `imul r, imm`
+//     (no multiply in this file); no >4 curried args.
+//   - Every value that must survive the `syscall` (the 3 out
+//     pointers) is parked in a callee-save register first, matching
+//     render_loop.pdx's conservative syscall-clobber discipline.
+//   - Reserved-label discipline: labels prefixed `fbs_`.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M3-001, §7.2.1
+// (paideia-os monorepo); design/audit/entries/b5-004-cap-invoke.md
+// (cap_invoke MVP semantics); design/user/syscall-table.md row 4
+// (sys_cap_invoke) and row 45 (misnumbered in some drafts -- the
+// canonical row is `| 4 | cap_invoke | slot, op_arg | ... |`); this
+// repo's #8; src/scanout.pdx (#4) for the shared WEAK-stub sentinel
+// values this module falls back to.
+
+module FbScanoutCap = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  // op_arg for a future per-kind KIND_FB_SCANOUT geometry query.
+  // Unused by today's B5-004 MVP dispatch (which ignores op_arg
+  // entirely) -- carried so this call site needs no change once a
+  // real per-kind handler lands and starts honouring it.
+  pub let FBS_OP_QUERY_GEOMETRY : u64 = 1
+
+  pub let FBS_RESULT_REAL_PTR   : u64 = 0
+  pub let FBS_RESULT_WEAK_STUB  : u64 = 1
+
+  // ==========================================================================
+  // kind_fb_scanout_query(cap_id, out_lfb_ptr, out_pitch, out_dims) -> u64
+  //
+  // Register plan: 3 callee-save pushes (r12=out_lfb_ptr,
+  // r13=out_pitch, r14=out_dims) so all three OUT pointers survive
+  // the one nested `syscall`. cap_id (rdi) needs no protection -- it
+  // is consumed as the syscall's first argument and never read again.
+  // ==========================================================================
+
+  pub let kind_fb_scanout_query : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (cap_id: u64) (out_lfb_ptr: u64) (out_pitch: u64) (out_dims: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R102.M3-001 (#8): FbScanoutCap::kind_fb_scanout_query. Parks out_lfb_ptr/out_pitch/out_dims into r12/r13/r14 (callee-save) before the syscall; cap_id stays in rdi (consumed immediately as arg1, never needed again). Issues rsi=1 (FBS_OP_QUERY_GEOMETRY, unused by today's MVP dispatch but forward-documented), rax=4 (sys_cap_invoke, design/user/syscall-table.md row 4); syscall -> rax=result. result==0 or result==0xFFFFFFFFFFFFFFFE (INVOKE_RESULT_INVALID_HANDLE, per design/audit/entries/b5-004-cap-invoke.md) means the slot did not resolve to a live descriptor -- the ONLY possible outcome today since no loader hands this process a real FB_SCANOUT cap -- so r9 falls back to the WEAK-stub sentinel (0xFFFFF00000000000, matching scanout.pdx's scanout_init) and r11 (return status) is set to FBS_RESULT_WEAK_STUB=1; otherwise r9 = the real pointer and r11 stays FBS_RESULT_REAL_PTR=0. Writes *out_lfb_ptr = r9 unconditionally. pitch (7680) and dims (1920 | 1080<<32, via `shl rax,32; or rax,r10`) are written UNCONDITIONALLY as WEAK-stub values regardless of the pointer outcome -- cap_invoke's MVP returns one u64 (target_ptr), never a structured geometry record, so there is no code path today, real-pointer or not, that could populate pitch/dims honestly. 3 callee-save pushes (r12/r13/r14) satisfy SysV across the one nested syscall. Labels prefixed fbs_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rsi;                        // out_lfb_ptr
+        mov r13, rdx;                        // out_pitch
+        mov r14, rcx;                        // out_dims
+
+        mov rsi, 1;                          // FBS_OP_QUERY_GEOMETRY
+        mov rax, 4;                          // sys_cap_invoke
+        syscall;
+
+        mov r10, 0xFFFFFFFFFFFFFFFE;         // INVOKE_RESULT_INVALID_HANDLE
+        xor r11, r11;                        // status = FBS_RESULT_REAL_PTR
+        cmp rax, 0;
+        je  fbs_weak;
+        cmp rax, r10;
+        je  fbs_weak;
+        mov r9, rax;                         // r9 = real pointer
+        jmp fbs_have_ptr;
+
+      fbs_weak:
+        mov r9, 0xFFFFF00000000000;          // WEAK-stub sentinel (matches Scanout)
+        mov r11, 1;                          // status = FBS_RESULT_WEAK_STUB
+
+      fbs_have_ptr:
+        mov [r12 + 0], r9;                   // *out_lfb_ptr
+
+        mov rax, 7680;                       // WEAK-stub pitch, always
+        mov [r13 + 0], rax;
+
+        mov rax, 1080;
+        shl rax, 32;
+        mov r10, 1920;
+        or  rax, r10;                        // packed dims: w=1920, h=1080
+        mov [r14 + 0], rax;                  // WEAK-stub dims, always
+
+        mov rax, r11;                        // return status
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+}

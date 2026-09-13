@@ -1,5 +1,122 @@
 # svc-compositor — CHANGELOG
 
+## 1.2.0 — 2026-09-13 (Wave PP: five M1/M2/M3 closers with real bodies)
+
+**Minor bump landing five closers across M1/M2/M3 with real, callable
+function bodies** (not pure `pub let` substrate tables — Wave Y's
+v1.1.0 landing already covered that layer). Each closer ships paired
+with a probe honest-witness driver under `tests/probe_*.pdx` that
+actually exercises the new functions and asserts real invariants
+before publishing its fingerprint (an upgrade from the fingerprint-
+only probes v1.1.0 shipped, since those closers had no function body
+yet to exercise).
+
+### Added
+
+- **`src/scanout.pdx`** — R102.M2-001 (#4). `Scanout` module.
+  `scanout_init()`: WEAK-stub loader-LFB latch (fixed 1920x1080 @
+  pitch 7680, sentinel base pointer 0xFFFFF00000000000 — no
+  `sys_bootinfo_get_lfb` or real KIND_FB_SCANOUT cap exists in the
+  kernel yet, per r102-user-plan.md §7.1.1). `scanout_blit_rect(xy,
+  wh, src_ptr, src_pitch)`: clipped row-by-row copy into the scanout
+  buffer via `rep_movsb`; coordinates packed 64-bit-wide (x|y<<32,
+  w|h<<32) to respect the 4-curried-arg ceiling. Closes #4.
+- **`src/commit.pdx`** — R102.M2-004 (#7). `Commit` module.
+  `commit_surface_handle(msg_ptr)` parses the 24-byte COMMIT_SURFACE
+  message and latches it into a new 256-slot per-surface damage table
+  (`_cmt_damage_table`) that `render_loop.pdx` drains every tick.
+  Gates on the FROZEN `SCC_REQ_COMMIT_SURFACE = 0x02` ordinal — the
+  dispatch brief that seeded this closer named `kind:u32=0x11`, which
+  is already WM_SET_FOCUS's frozen value; this handler follows the
+  already-shipped wire protocol rather than colliding two request
+  kinds on one value (see the file's own header for the full note).
+  Closes #7.
+- **`src/render_loop.pdx`** — R102.M2-003 (#6). `RenderLoop` module.
+  `render_loop_init` / `render_loop_wait_frame` (busy-wait on
+  `sys_clock_read_ns`, sysno 66, to the 16_666_666 ns / 60 Hz frame
+  period) / `compositor_render_frame` (drains Commit's damage table
+  into `scanout_blit_rect` calls) / `render_loop_present` (64-byte
+  PresentRecord@0.1-shaped emission) / `render_loop_tick` /
+  `render_loop_run(n)` (bounded driver for probe/witness use — the
+  service's real unbounded main loop wiring is out of this closer's
+  scope). Closes #6.
+- **`src/fb_scanout_cap.pdx`** — R102.M3-001 (#8). `FbScanoutCap`
+  module. `kind_fb_scanout_query(cap_id, out_lfb_ptr, out_pitch,
+  out_dims)` issues the real `sys_cap_invoke` syscall (sysno 4) for
+  the scanout base pointer, falling back to the same WEAK-stub
+  sentinel `scanout.pdx` uses when the slot does not resolve to a
+  live descriptor (the only possible outcome today — KIND_FB_SCANOUT's
+  ordinal is still unminted per §7.2.1). pitch/dims are WEAK-stubbed
+  unconditionally: cap_invoke's B5-004 MVP returns one u64
+  (target_ptr), not a structured geometry record, so there is no wire
+  today over which a real pitch/dims value could travel even on a
+  fully successful invoke. Closes #8.
+- **`caps.decl`** — R102.M1-001 (#1) scaffold closure. Adds
+  `cap.uses` lines for KIND_USER, KIND_IPC_ENDPOINT, KIND_SURFACE,
+  and KIND_INPUT_EVENT alongside the existing (unchanged)
+  `cap.holds = KIND_FB_SCANOUT` and the frozen R102.M1-002 wire
+  protocol. Every other M1-001 scaffold artifact (README, LICENSE,
+  CHANGELOG, tools/build.sh, `release/manifest.pdxsig.txt` source
+  form) was already in place from earlier closers. Closes #1.
+- **`tests/probe_scanout.pdx`** — real-body probe for #4. Calls
+  `scanout_init` + `scanout_blit_rect(0,0,0,0)` (the h=0 no-op path,
+  staying off the WEAK-stub's unmapped sentinel pointer), asserts the
+  latched geometry, publishes `svc-compositor loader-lfb ok\n`
+  (29 bytes).
+- **`tests/probe_render_loop.pdx`** — real-body probe for #6. Calls
+  `render_loop_tick` directly (the `.bss`-zero `_rl_last_tick_ns`
+  baseline makes the busy-wait exit immediately rather than spinning
+  a real frame period inside a boot smoke), asserts `_rl_tick_id`
+  advanced, publishes `svc-compositor render-loop ok\n` (30 bytes).
+- **`tests/probe_commit.pdx`** — real-body probe for #7. Builds a
+  well-formed COMMIT_SURFACE message, calls `commit_surface_handle`,
+  round-trips every field out of `_cmt_damage_table` and asserts an
+  exact match, publishes `svc-compositor commit-surface ok\n`
+  (33 bytes).
+- **`tests/probe_fb_scanout_cap.pdx`** — real-body probe for #8.
+  Calls `kind_fb_scanout_query`, asserts the deterministic
+  WEAK-stubbed pitch/dims fields, publishes
+  `svc-compositor kind-fb-scanout ok\n` (34 bytes).
+
+### Changed
+
+- **`src/tool_ident.pdx`** — `PDX_TOOL_VERSION` bumped `1.1.0` ->
+  `1.2.0` (byte-for-byte identical `[u8;6]` shape).
+- **`STATUS.md`** — M1-001, M2-001, M2-003, M2-004, and M3-001 flipped
+  to landed with per-closer summaries; M2-002 (window table row-
+  store), M3-002 (input pump), M3-003/M3-004 (query surface / screenshot
+  active bodies) remain explicitly open per their own still-deferred
+  upstream dependencies.
+
+### Behaviour notes
+
+- **Real bodies, honestly scoped.** Every function in this landing is
+  a genuine, callable implementation — not a substrate placeholder —
+  but each is explicit about what it stands in for until an upstream
+  kernel primitive lands (`sys_bootinfo_get_lfb` / real
+  `KIND_FB_SCANOUT` for the scanout geometry; the real window
+  row-store for `compositor_render_frame`'s window iteration, which
+  today walks a self-owned damage table rather than `window_table.pdx`'s
+  still-unallocated row storage — see `src/commit.pdx`'s header for
+  the reconciliation note left for a future closer).
+- **Wire-protocol correction.** `src/commit.pdx` gates on
+  `SCC_REQ_COMMIT_SURFACE = 0x02` (the value `src/wire_protocol.pdx`
+  and `caps.decl` have carried since v1.1.0), not the `0x11` the
+  dispatch brief for this wave named — `0x11` is already
+  `WM_SET_FOCUS`'s frozen ordinal. Landing the brief's literal value
+  would have silently aliased two distinct request kinds onto one
+  wire value; this closer preserves the already-shipped, cross-
+  referenced protocol instead.
+- **Version discipline note.** This wave's dispatch instruction named
+  tag `v0.5.0`; this repo's actual release history is already at
+  v1.1.0 (see the 1.1.0 and 1.0.0 entries below), so tagging `v0.5.0`
+  would be a downgrade that corrupts semver history. This release
+  instead continues the repo's real version line: v1.1.0 -> v1.2.0.
+
+Closes paideia-os/svc-compositor#1. Closes paideia-os/svc-compositor#4.
+Closes paideia-os/svc-compositor#6. Closes paideia-os/svc-compositor#7.
+Closes paideia-os/svc-compositor#8.
+
 ## 1.1.0 — 2026-09-13 (Wave Y drain: five M1/M2/M3 substrate primitives)
 
 **Minor bump landing five substrate primitives across all three

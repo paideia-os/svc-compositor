@@ -1,0 +1,71 @@
+// tests/probe_scanout.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M2-001 / #4)
+// ProbeScanout: real-body witness for the M2-001 loader-LFB scanout
+// closer. Unlike the v1.1.0 substrate-only probes (pure fingerprint
+// stubs, since their closers shipped `pub let`-only data), this probe
+// actually exercises src/scanout.pdx's live functions before
+// asserting: calls scanout_init, verifies the WEAK-stub geometry it
+// latches, then calls scanout_blit_rect with w=0/h=0 (a real call
+// into the real function, staying off the WEAK-stub's unmapped
+// sentinel pointer -- see scanout.pdx's own header for why a nonzero
+// w/h would fault here). Publishes the fingerprint issue #4 names to
+// fd 1 only if every assertion passes.
+//
+// paideia-as encoder notes: identical syscall shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_scan_`.
+
+module ProbeScanout = structure {
+
+  pub let probe_scan_fp     : [u8; 30] = "svc-compositor loader-lfb ok\n\0"
+  pub let probe_scan_fp_len : u64      = 29
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M2-001 (#4): ProbeScanout::run. Calls scanout_init (external symbol, src/scanout.pdx); asserts rax==0. Re-reads _lfb_width/_lfb_height/_lfb_pitch (external symbols) and asserts they match the fixed WEAK-stub geometry (1920/1080/7680) issue #4 names. Calls scanout_blit_rect(0,0,0,0) -- xy=0 wh=0 src_ptr=0 src_pitch=0 -- which takes the h==0 no-op path (loop bound check `cmp rax,r8; jae scan_blit_ok` is immediately true since the loop counter starts at 0 and h clamps to 0), so no memory is dereferenced through the WEAK-stub's unmapped sentinel pointer; asserts rax==0. Only after every assertion passes does it emit the fingerprint via sys_write (rdi=1, rsi=lea probe_scan_fp, rdx=29, rax=1, syscall) and assert a non-negative write count. Any assertion failure short-circuits to probe_scan_fail (rax=1, no fingerprint emitted) -- this probe never claims success for a real logic failure, matching feedback_workerbee_verify_claims discipline. No test rN,rN; no and rN,imm64; no byte-register mov. Labels prefixed probe_scan_.",
+      block: {
+        call scanout_init;
+        cmp rax, 0;
+        jne probe_scan_fail;
+
+        lea r10, [rip + _lfb_width];
+        mov rax, [r10 + 0];
+        cmp rax, 1920;
+        jne probe_scan_fail;
+
+        lea r10, [rip + _lfb_height];
+        mov rax, [r10 + 0];
+        cmp rax, 1080;
+        jne probe_scan_fail;
+
+        lea r10, [rip + _lfb_pitch];
+        mov rax, [r10 + 0];
+        cmp rax, 7680;
+        jne probe_scan_fail;
+
+        xor rdi, rdi;
+        xor rsi, rsi;
+        xor rdx, rdx;
+        xor rcx, rcx;
+        call scanout_blit_rect;
+        cmp rax, 0;
+        jne probe_scan_fail;
+
+        mov rdi, 1;
+        lea rsi, [rip + probe_scan_fp];
+        mov rdx, 29;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_scan_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_scan_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

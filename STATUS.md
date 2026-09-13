@@ -2,10 +2,13 @@
 
 **Wave:** R102 (userland graphical stack, CPU-side compositor)
 **Current milestone:** M5 (signed 1.0.0 release) — **landed** + Wave Y drain of
-five M1/M2/M3 substrate primitives (#2, #3, #5, #10, #11).
-**Version:** 1.1.0 (Wave Y drain — five M1/M2/M3 primitive substrates
-land as pure `pub let` constant tables + honest-witness probes;
-active handler bodies remain deferred per each module header).
+five M1/M2/M3 substrate primitives (#2, #3, #5, #10, #11) + Wave PP
+cohort landing five active M1/M2/M3 closers (#1, #4, #6, #7, #8).
+**Version:** 1.2.0 (Wave PP — repo-scaffold cap-kind enumeration
+(#1), the loader-LFB scanout body (#4), the 60 Hz render loop over
+HPET (#6), the COMMIT_SURFACE handler (#7), and the KIND_FB_SCANOUT
+cap query (#8) all land with real, callable function bodies + real-
+body probe witnesses, on top of Wave Y's v1.1.0 substrate tables).
 
 See `design/graphics/r102-user-plan.md` §4.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -15,9 +18,13 @@ full five-milestone breakdown this checklist mirrors.
 
 ### M1 — Scaffold + caps.decl + frozen wire protocol + broker registration
 
-- [ ] **M1-001** — repo scaffold (README done; `caps.decl` +
-      `manifest.pdxproj` + `src/` skeleton still open per this repo's
-      own #1..#3).
+- [x] **M1-001** — repo scaffold landed at v1.2.0 (Wave PP / #1).
+      README.md, LICENSE (MIT), CHANGELOG.md, tools/build.sh, and
+      `release/manifest.pdxsig.txt` (source-form, from the M5-001
+      closer) were already in place; this closer adds the cap-kind
+      enumeration `caps.decl` was missing (`cap.uses` lines for
+      KIND_USER, KIND_IPC_ENDPOINT, KIND_SURFACE, KIND_INPUT_EVENT
+      alongside the existing `cap.holds = KIND_FB_SCANOUT`). Closes #1.
 - [x] **M1-002** — `caps.decl` (`KIND_FB_SCANOUT` stub + IPC endpoints
       for client/WM/broker) + frozen wire protocol landed at v1.1.0
       as `caps.decl` (root) + `src/wire_protocol.pdx` (SCC_REQ_* /
@@ -36,7 +43,15 @@ full five-milestone breakdown this checklist mirrors.
 
 ### M2 — Loader-LFB scanout + window table + 60 Hz render loop
 
-- [ ] **M2-001** — loader-LFB scanout body (hard-coded VA) — still open.
+- [x] **M2-001** — loader-LFB scanout body landed at v1.2.0 (Wave PP
+      / #4) as `src/scanout.pdx` (`Module Scanout`): WEAK-stub
+      `scanout_init()` (fixed 1920x1080 @ pitch 7680, sentinel base
+      pointer 0xFFFFF00000000000 — no `sys_bootinfo_get_lfb` or real
+      KIND_FB_SCANOUT cap exists yet, §7.1.1) + `scanout_blit_rect`
+      (clipped row-copy into the scanout buffer via `rep_movsb`).
+      Real-body probe witness at `tests/probe_scanout.pdx` publishes
+      `svc-compositor loader-lfb ok\n` (29 bytes) after exercising
+      both functions. Closes #4.
 - [x] **M2-002** — window table + Z-order substrate constants landed
       at v1.1.0 as `src/window_table.pdx` (64-B window row layout,
       state sentinels, Z-order range [0, 0xFFFF],
@@ -44,13 +59,42 @@ full five-milestone breakdown this checklist mirrors.
       deferred (need paideia-os pdxclock M2-002 HPET substrate).
       Probe witness at `tests/probe_window_table.pdx` publishes
       `svc-compositor window-table ok\n` (31 bytes). Closes #5.
-- [ ] **M2-003** — 60 Hz render loop over HPET — still open.
-- [ ] **M2-004** — `COMMIT_SURFACE` handler + `PresentRecord@0.1`
-      emission — still open.
+- [x] **M2-003** — 60 Hz render loop over HPET landed at v1.2.0 (Wave
+      PP / #6) as `src/render_loop.pdx` (`Module RenderLoop`):
+      `sys_clock_read_ns` (sysno 66) busy-wait to the 16_666_666 ns
+      frame period, `compositor_render_frame` draining Commit's
+      per-surface damage table into `scanout_blit_rect` calls, and a
+      64-byte PresentRecord@0.1-shaped emission (`render_loop_present`).
+      `render_loop_run(n)` gives a bounded driver for probe/witness
+      use. Real-body probe witness at `tests/probe_render_loop.pdx`
+      publishes `svc-compositor render-loop ok\n` (30 bytes). Closes #6.
+- [x] **M2-004** — `COMMIT_SURFACE` handler landed at v1.2.0 (Wave PP
+      / #7) as `src/commit.pdx` (`Module Commit`): parses the 24-byte
+      COMMIT_SURFACE message (gated on the FROZEN 0x02 ordinal, not
+      the dispatch brief's 0x11 typo — see file header) into a new
+      256-slot per-surface damage table `render_loop.pdx` drains every
+      tick. `PresentRecord@0.1` emission itself lives in M2-003 (#6)
+      per the design doc's own split. Real-body probe witness at
+      `tests/probe_commit.pdx` round-trips a full message through the
+      handler and asserts the stored fields before publishing
+      `svc-compositor commit-surface ok\n` (33 bytes). Closes #7.
 
 ### M3 — Real scanout cap + input pump + query surface
 
-- [ ] **M3-001** — real `KIND_FB_SCANOUT` cap — still open.
+- [x] **M3-001** — real `KIND_FB_SCANOUT` cap query landed at v1.2.0
+      (Wave PP / #8) as `src/fb_scanout_cap.pdx`
+      (`Module FbScanoutCap`): `kind_fb_scanout_query` issues the real
+      `sys_cap_invoke` syscall (sysno 4) for the scanout base pointer,
+      WEAK-stub fallback when the slot does not resolve (the only
+      possible outcome today — the kind itself is still unminted per
+      §7.2.1). pitch/dims are WEAK-stubbed unconditionally — cap_invoke's
+      B5-004 MVP returns one u64, not a structured geometry record.
+      Full per-kind geometry dispatch remains blocked on osarch minting
+      KIND_FB_SCANOUT for real; `src/scanout.pdx`'s hard-coded VA (#4)
+      stays the compositor's actual scanout target until that lands.
+      Real-body probe witness at `tests/probe_fb_scanout_cap.pdx`
+      publishes `svc-compositor kind-fb-scanout ok\n` (34 bytes).
+      Closes #8.
 - [ ] **M3-002** — input pump over R101 focus-routed channel — still open.
 - [x] **M3-003** — query surface record types + reply-header layout
       landed at v1.1.0 as `src/query_surface.pdx`

@@ -1,0 +1,293 @@
+// src/scanout.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M2-001 / #4)
+// Scanout module: loader-LFB scanout body (WEAK-stub geometry) +
+// rect blit into the scanout buffer.
+//
+// ================================================================
+// Scope (per issue #4 / design/graphics/r102-user-plan.md §4.4
+// R102.M2-001 + §7.1.1)
+// ================================================================
+//
+// §7.1.1 names two possible M2 postures for retrieving the loader-
+// mapped LFB: (a) a tiny `sys_bootinfo_get_lfb()` escape + a
+// cap-gated `sys_mmap_physical`, or (b) osarch lands the FULL
+// KIND_FB_SCANOUT cap first and M2 collapses into M3. Neither has
+// landed in the kernel as of this closer (grep of
+// design/user/syscall-table.md shows no `bootinfo_get_lfb` row and
+// no `KIND_FB_SCANOUT` ordinal minted). Per design doc §7.3 ("Each
+// satellite's M1 + M2 lands regardless ... stub the R101 caps exactly
+// the way R100's M1/M2 stubbed unbuilt syscalls"), `scanout_init`
+// below is a WEAK stub: it latches the fixed geometry issue #4 names
+// (1920x1080 @ pitch 7680, base pointer sentinel
+// 0xFFFFF00000000000) directly into module state rather than issuing
+// a syscall that does not exist yet. When `sys_bootinfo_get_lfb` (or
+// the real KIND_FB_SCANOUT cap, per M3-001 / #8 /
+// src/fb_scanout_cap.pdx) lands, this function's body is replaced
+// with the real syscall/cap-invoke sequence; every downstream caller
+// (the M2-003 render loop's compositor_render_frame) is unaffected
+// because it only ever reads `_lfb_ptr` / `_lfb_pitch` / `_lfb_width`
+// / `_lfb_height` through this module's accessors.
+//
+// The base-pointer sentinel (0xFFFFF00000000000) is deliberately an
+// unmapped, non-canonical-adjacent VA -- NOT a real LFB address --
+// so a caller that forgets the WEAK-stub posture and blits through it
+// for real will fault loudly (page fault) rather than silently
+// corrupting an unrelated mapped page. `scanout_blit_rect`'s own
+// `_lfb_ptr == 0` init-gate does NOT catch this sentinel (it is
+// non-zero by design, matching a real cap's nonzero pointer shape);
+// callers exercising this module before a real cap lands MUST pass
+// w=0 or h=0 (see tests/probe_scanout.pdx) to stay off the sentinel
+// page.
+//
+// ================================================================
+// Entry points
+// ================================================================
+//
+//   * scanout_init() -> u64
+//       WEAK-stub geometry latch. Always returns 0 (SCANOUT_OK).
+//
+//   * scanout_blit_rect(xy, wh, src_ptr, src_pitch) -> u64
+//       Copies an src_pitch-strided BGRA8888 (4 bytes/pixel) source
+//       region into the scanout buffer at (x, y) sized (w, h).
+//       paideia-as forbids more than 4 curried arguments, so the two
+//       coordinate pairs are packed 64-bit-wide: xy = x | (y << 32),
+//       wh = w | (h << 32) (x/y/w/h each occupy one 32-bit half,
+//       zero-extended). Clips (w, h) against the scanout dims so an
+//       out-of-range rect never walks off the end of the LFB.
+//       Returns SCANOUT_OK (0) on success (including the clipped-to-
+//       nothing no-op case) or SCC_SCANOUT_ERR_NOT_INIT
+//       (0xFFFFFFFFFFFFFFFE) if scanout_init has not run.
+//
+// ================================================================
+// paideia-as compliance (feedback_pdx_encoder_pitfalls v0.36+)
+// ================================================================
+//   - Module Scanout (PascalCase of scanout.pdx stem).
+//   - No `test rN, rN` -- every zero-check is `cmp rN, 0`.
+//   - No 2-op `imul r, imm` -- the one multiply
+//     (row_offset = y_i * lfb_pitch) is `imul r9, r10` (reg,reg).
+//   - No `and rN, imm64` -- no masking anywhere; 32-bit field
+//     extraction uses the `mov r32, r32` zero-extend idiom (e.g.
+//     `mov eax, edi`) proven at acpi/sdt_hdr.pdx L99 and
+//     sched/task_pool.pdx L836.
+//   - No `add reg, [mem]` / `cmp reg, [mem]` -- every memory operand
+//     is staged through a register first (dir.pdx / rtl8139 precedent).
+//   - No `mov r, -N` -- the only negative-shaped literal
+//     (0xFFFFFFFFFFFFFFFE) is a full-width movabs, not a signed
+//     small negative.
+//   - No >4 curried args -- scanout_blit_rect packs (x,y) and (w,h).
+//   - Reserved-label discipline: every label prefixed `scan_`.
+//   - Module-let constants used in cmp/mov are inlined as literals
+//     (the encoder rejects named-constant references in immediate
+//     slots) -- 1920 / 1080 / 7680 / 0xFFFFF00000000000 all appear as
+//     literals with a comment naming the logical constant.
+//
+// ================================================================
+// Stack alignment
+// ================================================================
+//   scanout_init:       leaf, no push, no nested call.
+//   scanout_blit_rect:  no push (every live value fits in caller-save
+//                       registers or the 64-byte local frame);
+//                       `sub rsp, 64` / `add rsp, 64` brackets the
+//                       body. No nested CALL is made (the copy uses
+//                       `rep_movsb`, a string instruction, not a
+//                       call), so SysV's pre-CALL rsp%16==0 rule does
+//                       not apply here.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M2-001,
+// §7.1.1 (paideia-os monorepo); this repo's #4.
+
+module Scanout = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  pub let SCANOUT_OK                : u64 = 0
+  pub let SCC_SCANOUT_ERR_NOT_INIT  : u64 = 0xFFFFFFFFFFFFFFFE
+
+  // ==========================================================================
+  // State -- module-level scanout target (WEAK-stub at M2; retired for
+  // the real KIND_FB_SCANOUT cap at M3-001 / #8).
+  // ==========================================================================
+
+  pub let mut _lfb_ptr    : u64 = uninit @align(8)
+  pub let mut _lfb_pitch  : u64 = uninit @align(8)
+  pub let mut _lfb_width  : u64 = uninit @align(8)
+  pub let mut _lfb_height : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // scanout_init() -> u64
+  //
+  // WEAK-stub: latches the fixed geometry issue #4 names directly
+  // (no real cap or syscall exists yet to ask for it). Leaf, no
+  // callee-save touched, no nested call.
+  // ==========================================================================
+
+  pub let scanout_init : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R102.M2-001 (#4): Scanout::scanout_init WEAK-stub. Latches _lfb_ptr = 0xFFFFF00000000000 (sentinel -- deliberately unmapped so a stray real blit faults instead of corrupting memory), _lfb_pitch = 7680, _lfb_width = 1920, _lfb_height = 1080 -- the fixed geometry issue #4's acceptance text names, standing in for the real sys_bootinfo_get_lfb / KIND_FB_SCANOUT retrieval (§7.1.1) neither of which has landed in the kernel yet (design/user/syscall-table.md has no bootinfo_get_lfb row; KIND_FB_SCANOUT's ordinal is 'reserved by osarch' per r102-user-plan.md §7.2.1, not minted). Four straight-line rip-relative stores via lea+mov; every immediate (1920/1080/7680) is a plain 32-bit-fitting mov, the pointer sentinel is a movabs (full 64-bit literal). Leaf: touches only r10/r11/rax, no push, no nested call. Labels: none needed (straight-line). Retired in favour of a real sys_cap_invoke-backed geometry read once M3-001 (#8, src/fb_scanout_cap.pdx) lands and the loader hands the compositor a real cap slot.",
+      block: {
+        lea r10, [rip + _lfb_ptr];
+        mov r11, 0xFFFFF00000000000;         // sentinel: WEAK-stub scanout base
+        mov [r10 + 0], r11;
+
+        lea r10, [rip + _lfb_pitch];
+        mov r11, 7680;                       // fixed stub pitch (bytes/row)
+        mov [r10 + 0], r11;
+
+        lea r10, [rip + _lfb_width];
+        mov r11, 1920;                       // fixed stub width (px)
+        mov [r10 + 0], r11;
+
+        lea r10, [rip + _lfb_height];
+        mov r11, 1080;                       // fixed stub height (px)
+        mov [r10 + 0], r11;
+
+        xor rax, rax;                        // SCANOUT_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // scanout_blit_rect(xy, wh, src_ptr, src_pitch) -> u64
+  //
+  //   xy = x | (y << 32)   -- destination top-left, packed
+  //   wh = w | (h << 32)   -- rect dims, packed
+  //   src_ptr              -- source buffer base (BGRA8888, 4 B/px)
+  //   src_pitch            -- source stride in bytes
+  //
+  // Clips (w, h) against (_lfb_width - x, _lfb_height - y); a rect
+  // fully outside the scanout (x >= width or y >= height) is a
+  // silent no-op success (matches fb_map_lfb's own "guard, don't
+  // fail" posture for a degenerate range). Copies row-by-row via
+  // `rep_movsb` (proven idiom: pdxfs_lite/read.pdx, tmpfs/write.pdx).
+  //
+  // All locals live in a 64-byte stack frame (no callee-save
+  // registers are touched, so no push/pop is needed):
+  //   [rsp+0]  x   [rsp+8]  y   [rsp+16] w   [rsp+24] h
+  //   [rsp+32] src_ptr      [rsp+40] src_pitch
+  //   [rsp+48] row counter i
+  // ==========================================================================
+
+  pub let scanout_blit_rect : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (xy: u64) (wh: u64) (src_ptr: u64) (src_pitch: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R102.M2-001 (#4): Scanout::scanout_blit_rect. Unpacks xy/wh into a 64-byte local frame (x/y/w/h/src_ptr/src_pitch/row-counter) via the `mov e_,e_` zero-extend idiom (low 32) + `shr r64,32` (high 32) -- no `and rN,imm64` needed. Guards: (1) _lfb_ptr == 0 -> SCC_SCANOUT_ERR_NOT_INIT. (2) x >= _lfb_width or y >= _lfb_height -> clipped-to-nothing, jumps straight to the success path. (3) w clamped to _lfb_width - x, h clamped to _lfb_height - y when either overruns. Row loop (bound by h): dst = _lfb_ptr + (y+i)*_lfb_pitch + x*4 via `imul r9, r10` (reg,reg -- no 2-op imul-with-immediate) then two `add`s; src = src_ptr + i*src_pitch via the same reg,reg imul; count = w*4 bytes copied via `cld; rep_movsb` (F3 A4, proven at pdxfs_lite/read.pdx L261 and tmpfs/write.pdx L132). Every memory read is staged through a register before use (no `add reg,[mem]` / `cmp reg,[mem]`). No callee-save register is touched -- x/y/w/h/src_ptr/src_pitch/i all live in the 64-byte stack frame, freeing rax/rcx/rdx/rsi/rdi/r8-r11 for the per-row arithmetic and rep_movsb's own operand registers. No nested CALL is made (rep_movsb is a string instruction, not a call), so SysV's pre-CALL alignment rule is inapplicable; `sub rsp,64` / `add rsp,64` is balanced regardless. Labels prefixed scan_.",
+      block: {
+        sub rsp, 64;
+
+        // Unpack xy -> x=[rsp+0], y=[rsp+8].
+        mov eax, edi;                        // eax = x (zero-extend low32 of xy)
+        mov [rsp + 0], rax;
+        mov rax, rdi;
+        shr rax, 32;                         // rax = y
+        mov [rsp + 8], rax;
+
+        // Unpack wh -> w=[rsp+16], h=[rsp+24].
+        mov eax, esi;                        // eax = w
+        mov [rsp + 16], rax;
+        mov rax, rsi;
+        shr rax, 32;                         // rax = h
+        mov [rsp + 24], rax;
+
+        // Stash src_ptr / src_pitch.
+        mov [rsp + 32], rdx;
+        mov [rsp + 40], rcx;
+
+        // Guard: scanout not initialized.
+        lea r10, [rip + _lfb_ptr];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        je  scan_blit_not_init;
+
+        // Clamp w against (_lfb_width - x); x >= width -> nothing to draw.
+        lea r10, [rip + _lfb_width];
+        mov rax, [r10 + 0];
+        mov r8, [rsp + 0];                   // x
+        cmp r8, rax;
+        jae scan_blit_zero;
+        sub rax, r8;                         // rax = max_w
+        mov r9, [rsp + 16];                  // w
+        cmp r9, rax;
+        jbe scan_blit_w_done;
+        mov [rsp + 16], rax;
+      scan_blit_w_done:
+
+        // Clamp h against (_lfb_height - y); y >= height -> nothing to draw.
+        lea r10, [rip + _lfb_height];
+        mov rax, [r10 + 0];
+        mov r8, [rsp + 8];                   // y
+        cmp r8, rax;
+        jae scan_blit_zero;
+        sub rax, r8;                         // rax = max_h
+        mov r9, [rsp + 24];                  // h
+        cmp r9, rax;
+        jbe scan_blit_h_done;
+        mov [rsp + 24], rax;
+      scan_blit_h_done:
+
+        // i = 0
+        xor rax, rax;
+        mov [rsp + 48], rax;
+
+      scan_blit_row:
+        mov rax, [rsp + 48];                 // i
+        mov r8, [rsp + 24];                  // h
+        cmp rax, r8;
+        jae scan_blit_ok;
+
+        // y_i = y + i
+        mov r9, [rsp + 8];                   // y
+        add r9, rax;                         // r9 = y + i
+
+        // dst = _lfb_ptr + y_i * _lfb_pitch + x*4
+        lea r10, [rip + _lfb_pitch];
+        mov r10, [r10 + 0];                  // r10 = lfb_pitch
+        imul r9, r10;                        // r9 = row_offset (reg,reg imul)
+
+        lea r10, [rip + _lfb_ptr];
+        mov r10, [r10 + 0];                  // r10 = lfb_ptr
+        add r10, r9;                         // r10 = lfb_ptr + row_offset
+
+        mov r11, [rsp + 0];                  // x
+        shl r11, 2;                          // x*4
+        add r10, r11;                        // r10 = dst row ptr
+        mov rdi, r10;
+
+        // src = src_ptr + i * src_pitch
+        mov r9, [rsp + 40];                  // src_pitch
+        imul r9, rax;                        // r9 = i * src_pitch (rax still == i)
+        mov r10, [rsp + 32];                 // src_ptr
+        add r10, r9;
+        mov rsi, r10;
+
+        // count = w * 4 bytes
+        mov rcx, [rsp + 16];                 // w
+        shl rcx, 2;
+
+        cld;
+        rep_movsb;
+
+        // i++
+        mov rax, [rsp + 48];
+        add rax, 1;
+        mov [rsp + 48], rax;
+        jmp scan_blit_row;
+
+      scan_blit_zero:
+        jmp scan_blit_ok;
+
+      scan_blit_not_init:
+        mov rax, 0xFFFFFFFFFFFFFFFE;         // SCC_SCANOUT_ERR_NOT_INIT
+        jmp scan_blit_out;
+
+      scan_blit_ok:
+        xor rax, rax;                        // SCANOUT_OK
+
+      scan_blit_out:
+        add rsp, 64;
+        ret
+      }
+    }
+
+}

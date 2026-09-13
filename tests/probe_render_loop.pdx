@@ -1,0 +1,51 @@
+// tests/probe_render_loop.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M2-003 / #6)
+// ProbeRenderLoop: real-body witness for the 60 Hz render loop
+// closer. Calls render_loop_tick() directly (skipping
+// render_loop_init) so the busy-wait in render_loop_wait_frame sees
+// _rl_last_tick_ns at its .bss zero baseline -- any wall-clock ns
+// value since boot is already >= the 16_666_666 ns frame period, so
+// the wait returns immediately rather than spinning for a real frame
+// period inside a boot smoke. Asserts the tick completed and
+// _rl_tick_id advanced to 1 before publishing the fingerprint.
+//
+// paideia-as encoder notes: identical syscall shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_rl_`.
+
+module ProbeRenderLoop = structure {
+
+  pub let probe_rl_fp     : [u8; 31] = "svc-compositor render-loop ok\n\0"
+  pub let probe_rl_fp_len : u64      = 30
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M2-003 (#6): ProbeRenderLoop::run. Calls render_loop_tick (external symbol, src/render_loop.pdx) with no preceding render_loop_init -- _rl_last_tick_ns's .bss zero baseline makes render_loop_wait_frame's first delta computation (now_ns - 0) trivially exceed the 16666666 ns threshold, so the busy-wait exits on its first iteration without a real ~16.6 ms spin. Asserts rax==0. Re-reads _rl_tick_id (external symbol) and asserts it advanced to exactly 1 (render_loop_present bumps it unconditionally once per tick). Only then emits the fingerprint via sys_write and asserts a non-negative write count. Any assertion failure short-circuits to probe_rl_fail (rax=1, no fingerprint emitted). No test rN,rN; no and rN,imm64; no byte-register mov. Labels prefixed probe_rl_.",
+      block: {
+        call render_loop_tick;
+        cmp rax, 0;
+        jne probe_rl_fail;
+
+        lea r10, [rip + _rl_tick_id];
+        mov rax, [r10 + 0];
+        cmp rax, 1;
+        jne probe_rl_fail;
+
+        mov rdi, 1;
+        lea rsi, [rip + probe_rl_fp];
+        mov rdx, 30;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_rl_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_rl_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

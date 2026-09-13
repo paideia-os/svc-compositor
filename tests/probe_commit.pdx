@@ -1,0 +1,94 @@
+// tests/probe_commit.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M2-004 / #7)
+// ProbeCommit: real-body witness for the COMMIT_SURFACE handler
+// closer. Builds a well-formed 24-byte COMMIT_SURFACE message in a
+// local scratch buffer, calls commit_surface_handle, and verifies the
+// per-surface damage table slot was latched with exactly the values
+// the message carried before publishing the fingerprint.
+//
+// paideia-as encoder notes: identical syscall shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_cmt_`.
+
+module ProbeCommit = structure {
+
+  pub let probe_cmt_fp     : [u8; 34] = "svc-compositor commit-surface ok\n\0"
+  pub let probe_cmt_fp_len : u64      = 33
+
+  pub let mut _probe_cmt_msg : [u8; 24] = uninit @align(8)
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M2-004 (#7): ProbeCommit::run. Builds a well-formed COMMIT_SURFACE message (kind=2 SCC_REQ_COMMIT_SURFACE, surface_id=5, x=10, y=20, w=30, h=40, buffer_ptr=0x1234567890ABCDEF -- a recognizable never-dereferenced test marker) into _probe_cmt_msg via `mov [mem],e_` 32-bit stores + `mov_w [mem],r_` 16-bit stores + a `mov [mem],r_` 64-bit store. Calls commit_surface_handle (external symbol, src/commit.pdx) with rdi = the message address; asserts rax==0 (CMT_OK). Re-reads _cmt_damage_table (external symbol) at slot index surface_id*4=20 and asserts dirty_flag==1, xy==10|(20<<32), wh==30|(40<<32), buffer_ptr==0x1234567890ABCDEF -- an exact round-trip check, not merely 'the call did not crash'. Only then emits the fingerprint via sys_write. Any assertion failure short-circuits to probe_cmt_fail (rax=1, no fingerprint emitted). No test rN,rN; no and rN,imm64; no byte-register mov (u16 fields go through mov_w, zero-extending). Labels prefixed probe_cmt_.",
+      block: {
+        lea r10, [rip + _probe_cmt_msg];
+
+        mov eax, 2;
+        mov [r10 + 0], eax;                  // kind = SCC_REQ_COMMIT_SURFACE
+        mov eax, 5;
+        mov [r10 + 4], eax;                  // surface_id = 5
+
+        mov rax, 10;
+        mov_w [r10 + 8], rax;                // x = 10
+        mov rax, 20;
+        mov_w [r10 + 10], rax;               // y = 20
+        mov rax, 30;
+        mov_w [r10 + 12], rax;               // w = 30
+        mov rax, 40;
+        mov_w [r10 + 14], rax;               // h = 40
+
+        mov rax, 0x1234567890ABCDEF;
+        mov [r10 + 16], rax;                 // buffer_ptr (test marker)
+
+        mov rdi, r10;
+        call commit_surface_handle;
+        cmp rax, 0;
+        jne probe_cmt_fail;
+
+        mov r9, 5;
+        shl r9, 2;                           // r9 = 20 (slot u64-index)
+        lea r11, [rip + _cmt_damage_table];
+
+        mov rax, [r11 + r9*8 + 0];           // dirty_flag
+        cmp rax, 1;
+        jne probe_cmt_fail;
+
+        mov rax, [r11 + r9*8 + 8];           // xy
+        mov r8, 20;
+        shl r8, 32;
+        mov r10, 10;
+        or  r10, r8;                          // expected xy
+        cmp rax, r10;
+        jne probe_cmt_fail;
+
+        mov rax, [r11 + r9*8 + 16];          // wh
+        mov r8, 40;
+        shl r8, 32;
+        mov r10, 30;
+        or  r10, r8;                          // expected wh
+        cmp rax, r10;
+        jne probe_cmt_fail;
+
+        mov rax, [r11 + r9*8 + 24];          // buffer_ptr
+        mov r10, 0x1234567890ABCDEF;
+        cmp rax, r10;
+        jne probe_cmt_fail;
+
+        mov rdi, 1;
+        lea rsi, [rip + probe_cmt_fp];
+        mov rdx, 33;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_cmt_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_cmt_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}
