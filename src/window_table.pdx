@@ -1,0 +1,72 @@
+// src/window_table.pdx -- svc-compositor v1.1.0 (Wave Y: R102.M2-002 / #5)
+// WindowTable module: window-row struct constants + Z-order limits.
+//
+// Purpose
+// -------
+// Pins the window-row layout the compositor stores each subscribed
+// window into, plus the Z-order sentinels the render loop iterates
+// over front-to-back. The accept loop (M1-003) writes a row on each
+// SUBSCRIBE_WINDOW; the WM_PLACE_WINDOW handler updates screen_pos +
+// z_order in place; the M2-003 render loop sorts by z_order (large
+// = closer to viewer, small = further -- see render-loop closer) and
+// blits per-window damage rings into the scanout buffer.
+//
+// The struct-and-sentinel constants ship live at this closer. The
+// active handler bodies (WM_PLACE_WINDOW, the sort-by-z-order pass,
+// the front-to-back blit) land at their own closers once the render
+// loop's HPET substrate (paideia-os pdxclock M2-002) is live. The
+// probe witness at tests/probe_window_table.pdx publishes the
+// acceptance fingerprint on the same shape every honest-witness
+// driver in this repo uses.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module WindowTable (PascalCase of window_table.pdx stem).
+//   - Pure data (`pub let` only) -> no encoded instructions ->
+//     zero encoder pitfalls.
+//   - Every offset + limit fits in u32; each is exposed at u64 for
+//     the pointer-arithmetic dispatch that will read the struct.
+//   - Struct total is 8-byte aligned (padded RESERVED slot at the
+//     tail) so Vec<WindowRow> is naturally packed.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M2-002 +
+// §5.2 (paideia-os monorepo); this repo's #5.
+
+module WindowTable = structure {
+
+  // -- Window-row layout (48 bytes total, 8-byte aligned) --------------
+  pub let SCC_WIN_ROW_SIZE_BYTES     : u64 = 64
+
+  pub let SCC_WIN_OFF_WINDOW_ID      : u64 = 0    // u64
+  pub let SCC_WIN_OFF_SURFACE_SLOT   : u64 = 8    // u64 (client surface cap slot)
+  pub let SCC_WIN_OFF_SCREEN_X       : u64 = 16   // i32
+  pub let SCC_WIN_OFF_SCREEN_Y       : u64 = 20   // i32
+  pub let SCC_WIN_OFF_WIDTH          : u64 = 24   // u32
+  pub let SCC_WIN_OFF_HEIGHT         : u64 = 28   // u32
+  pub let SCC_WIN_OFF_Z_ORDER        : u64 = 32   // u32
+  pub let SCC_WIN_OFF_STATE          : u64 = 36   // u32
+  pub let SCC_WIN_OFF_DAMAGE_RING    : u64 = 40   // u64 (ptr)
+  pub let SCC_WIN_OFF_DAMAGE_LEN     : u64 = 48   // u32
+  pub let SCC_WIN_OFF_DAMAGE_CAP     : u64 = 52   // u32
+  pub let SCC_WIN_OFF_RESERVED       : u64 = 56   // u64 pad -> 64
+
+  // -- Window-state sentinels -----------------------------------------
+  pub let SCC_WIN_STATE_UNMAPPED     : u64 = 0
+  pub let SCC_WIN_STATE_MAPPED       : u64 = 1
+  pub let SCC_WIN_STATE_HIDDEN       : u64 = 2
+  pub let SCC_WIN_STATE_DYING        : u64 = 3
+
+  // -- Z-order range ---------------------------------------------------
+  // 0 == back-most (drawn first); Z_ORDER_MAX == front-most (drawn
+  // last, on top). The WM assigns; the compositor treats z_order as
+  // opaque and only compares by it during the sort pass.
+  pub let SCC_Z_ORDER_MIN            : u64 = 0
+  pub let SCC_Z_ORDER_MAX            : u64 = 0xFFFF
+
+  // -- Table cap -------------------------------------------------------
+  // Matches the per-service subscription-row cap in broker_accept.pdx
+  // so no row-table probe returns MORE windows than the accept loop
+  // can hold.
+  pub let SCC_MAX_WINDOWS            : u64 = 256
+
+}

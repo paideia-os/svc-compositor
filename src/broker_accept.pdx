@@ -1,0 +1,68 @@
+// src/broker_accept.pdx -- svc-compositor v1.1.0 (Wave Y: R102.M1-003 / #3)
+// BrokerAccept module: svc_broker registration constants + accept-loop
+// substrate (per-window subscription row layout).
+//
+// Purpose
+// -------
+// Names the svc_broker endpoint the compositor registers on at start-
+// up (R90-XREPO.012.M2-002 pattern shared org-wide) and pins the
+// per-window subscription-row layout the accept loop stores each
+// client SUBSCRIBE_WINDOW response into. The accept-loop body itself
+// (an sys_ipc_recv over the endpoint fd, a slot-store into a static
+// row table) requires two syscall wires that are not yet frozen in
+// paideia-os at Wave Y drain -- sys_ipc_recv's ordinal + the loader's
+// broker-fd hand-off record -- so this file ships the constants live
+// and defers the loop body to the closer that lands after those
+// prerequisites. The probe witness at tests/probe_accept_loop.pdx
+// publishes the acceptance fingerprint on the same shape every
+// honest-witness driver in this repo uses.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module BrokerAccept (PascalCase of broker_accept.pdx stem).
+//   - Pure data (`pub let` only) -> no encoded instructions ->
+//     zero encoder pitfalls (no `test`, no `and rN,imm64`, no `neg`,
+//     no byte-register mov, no >4-arg curried fn -- none reachable).
+//   - Every ordinal fits in u16; struct sizes fit in u16 too.
+//   - String literals include their trailing NUL in the [u8;N] size.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M1-003 +
+// §7.2.3 (paideia-os monorepo); this repo's #3; svc_broker pattern
+// per paideia-os R90-XREPO.012.M2-002.
+
+module BrokerAccept = structure {
+
+  // -- Broker registration identity ------------------------------------
+  // Name the compositor registers under on svc_broker. Byte-for-byte
+  // identical to `service.name` in the caps.decl at repo root.
+  pub let SCC_BROKER_NAME           : [u8; 16] = "svc.compositor\0\0"
+  pub let SCC_BROKER_NAME_LEN       : u64      = 14
+
+  // -- Registration wire codes (svc_broker side, org-wide) -------------
+  pub let SCC_BROKER_REGISTER       : u64 = 0x01
+  pub let SCC_BROKER_LOOKUP         : u64 = 0x02
+  pub let SCC_BROKER_UNREGISTER     : u64 = 0x03
+
+  // -- Per-window subscription-row layout -----------------------------
+  // Row size + field offsets the accept loop's slot-store path writes
+  // through. Kept aligned to 8 bytes so a Vec<Row> is naturally
+  // packed. Field ordinals are FROZEN at v1.1.0 (renumbering would
+  // ship as R102-v1 alongside a wire_protocol.pdx PROTOCOL_VERSION
+  // bump).
+  pub let SCC_ROW_SIZE_BYTES        : u64 = 48
+  pub let SCC_ROW_OFF_WINDOW_ID     : u64 = 0    // u64
+  pub let SCC_ROW_OFF_CLIENT_ENDPT  : u64 = 8    // u64 (fd/cap slot)
+  pub let SCC_ROW_OFF_EVENT_CHAN    : u64 = 16   // u64 (fd/cap slot)
+  pub let SCC_ROW_OFF_SUB_MASK      : u64 = 24   // u32 (event kinds)
+  pub let SCC_ROW_OFF_STATE         : u64 = 32   // u32 (row state)
+  pub let SCC_ROW_OFF_RESERVED      : u64 = 40   // u64 (pad -> 48)
+
+  // Row-state sentinels.
+  pub let SCC_ROW_STATE_FREE        : u64 = 0
+  pub let SCC_ROW_STATE_LIVE        : u64 = 1
+  pub let SCC_ROW_STATE_DYING       : u64 = 2
+
+  // Accept-loop table cap.
+  pub let SCC_MAX_SUBSCRIPTIONS     : u64 = 256
+
+}

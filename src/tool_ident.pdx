@@ -1,4 +1,4 @@
-// src/tool_ident.pdx -- svc-compositor v1.0.0 (Wave O drain: PDX_TOOL_NAME extern)
+// src/tool_ident.pdx -- svc-compositor v1.1.0 (Wave Y drain: M1/M2/M3 primitives + PDX_TOOL_NAME extern)
 // ToolIdent module: per-tool identity externs.
 //
 // Purpose
@@ -40,6 +40,6 @@
 module ToolIdent = structure {
 
   pub let PDX_TOOL_NAME    : [u8; 15] = "svc-compositor\0"
-  pub let PDX_TOOL_VERSION : [u8;  6] = "1.0.0\0"
+  pub let PDX_TOOL_VERSION : [u8;  6] = "1.1.0\0"
 
 }

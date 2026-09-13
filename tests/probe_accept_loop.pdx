@@ -1,0 +1,46 @@
+// tests/probe_accept_loop.pdx -- svc-compositor v1.1.0 (Wave Y: R102.M1-003 / #3)
+// ProbeAcceptLoop: honest-witness for the M1-003 broker registration
+// + accept-loop closer. Publishes the fingerprint issue #3 names to
+// fd 1.
+//
+// Substrate landed at v1.1.0 as pure `pub let` constants in
+// src/broker_accept.pdx: SCC_BROKER_NAME, SCC_BROKER_REGISTER, the
+// per-window subscription-row layout (48-byte row, 8-byte-aligned
+// field offsets), row-state sentinels, SCC_MAX_SUBSCRIPTIONS = 256.
+// What is deferred is the ACTIVE accept-loop body -- the sys_ipc_recv
+// / slot-store pass -- which needs sys_ipc_recv's frozen ordinal and
+// the loader's broker-fd hand-off record, both blocked on paideia-os
+// pdxbroker M1.
+//
+// paideia-as encoder notes: identical shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_accept_`.
+
+module ProbeAcceptLoop = structure {
+
+  pub let probe_accept_fp     : [u8; 31] = "svc-compositor accept-loop ok\n\0"
+  pub let probe_accept_fp_len : u64      = 30
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M1-003 (#3): ProbeAcceptLoop::run honest-witness. rdi=1, rsi=lea [rip+probe_accept_fp], rdx=30, rax=1 (sys_write), syscall. `cmp rax, 0; jl probe_accept_fail`. Success: xor rax, rax; ret. Failure: mov rax, 1; ret. No `test`, no `and rN, imm64`, no byte-register mov. Labels prefixed probe_accept_.",
+      block: {
+        mov rdi, 1;
+        lea rsi, [rip + probe_accept_fp];
+        mov rdx, 30;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_accept_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_accept_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

@@ -1,0 +1,57 @@
+// src/wire_protocol.pdx -- svc-compositor v1.1.0 (Wave Y: R102.M1-002 / #2)
+// WireProtocol module: frozen R102-v0 request/reply opcodes.
+//
+// Purpose
+// -------
+// One canonical, compile-time reference for every request code and
+// sentinel reply code the compositor's wire protocol names. Every
+// linked handler (src/broker_accept.pdx, src/query_surface.pdx,
+// src/screenshot_query.pdx at later closers) reads these constants
+// rather than re-hardcoding the ordinal, so a future R102-v1 renumber
+// touches ONE file. `caps.decl` at the repo root carries the same
+// ordinals as line-oriented text for the kernel-side loader; the two
+// files are hand-synchronized (there is no tool that generates one
+// from the other at v1.1.0 -- that codegen lives in a future R103
+// wave).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module WireProtocol (PascalCase of wire_protocol.pdx stem).
+//   - Pure data (`pub let` only) -> no encoded instructions ->
+//     zero encoder pitfalls. No `test`, no `and rN,imm64`, no `neg`,
+//     no byte-register mov, no >4-arg curried fn -- none reachable.
+//   - Every ordinal fits in u8; each also aliased at u64 for the
+//     handler dispatch tables that compare-against `rax`.
+//   - Fingerprint string ships live for the M1-002 probe witness at
+//     tests/probe_wire_protocol.pdx -- byte-for-byte identical to
+//     the issue's acceptance text.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M1-002 +
+// §5.1 (paideia-os monorepo); caps.decl at this repo's root
+// (line-oriented sibling of these constants); this repo's #2.
+
+module WireProtocol = structure {
+
+  // Protocol version tag -- ASCII, NUL-terminated. Any bump ships as
+  // "R102-v1\0" (8 bytes) on the same shape.
+  pub let PROTOCOL_VERSION      : [u8; 8] = "R102-v0\0"
+
+  // -- Client-issued request codes ------------------------------------
+  pub let SCC_REQ_SUBSCRIBE_WINDOW        : u64 = 0x01
+  pub let SCC_REQ_COMMIT_SURFACE          : u64 = 0x02
+
+  // -- WM-issued request codes ----------------------------------------
+  pub let SCC_REQ_WM_PLACE_WINDOW         : u64 = 0x10
+  pub let SCC_REQ_WM_SET_FOCUS            : u64 = 0x11
+
+  // -- Query-surface request codes ------------------------------------
+  pub let SCC_REQ_QUERY_LIST_WINDOWS      : u64 = 0x20
+  pub let SCC_REQ_QUERY_GET_FOCUS         : u64 = 0x21
+  pub let SCC_REQ_QUERY_GET_GEOMETRY      : u64 = 0x22
+  pub let SCC_REQ_QUERY_SCREENSHOT_REGION : u64 = 0x23
+
+  // -- Sentinel reply codes -------------------------------------------
+  pub let SCC_REPLY_OK                    : u64 = 0x00
+  pub let SCC_REPLY_SCREENSHOT_TOO_LARGE  : u64 = 0xE0
+
+}

@@ -1,0 +1,87 @@
+// src/query_surface.pdx -- svc-compositor v1.1.0 (Wave Y: R102.M3-003 / #10)
+// QuerySurface module: query-record type IDs, field offsets, and
+// tag constants for the read-only introspection endpoint.
+//
+// Purpose
+// -------
+// The compositor's `svc.compositor.query` endpoint (registered from
+// broker_accept.pdx) answers four read-only requests -- LIST_WINDOWS,
+// GET_FOCUS, GET_GEOMETRY, SCREENSHOT_REGION (the last one is layered
+// separately in src/screenshot_query.pdx). This file pins the record
+// tags + field offsets each reply record carries on the wire so a
+// linked handler (a later M3-003b closer) can serialize/deserialize
+// against ONE canonical layout table. Same discipline every R100
+// satellite ships for its query surface.
+//
+// The record layouts ship live at this closer. The active handler
+// bodies (LIST_WINDOWS iterator, GET_FOCUS resolver, GET_GEOMETRY
+// scanout-cap-reader) land at their own closers once the M3-001 real
+// KIND_FB_SCANOUT cap is live. The probe witness at
+// tests/probe_query.pdx publishes the acceptance fingerprint on the
+// same shape every honest-witness driver in this repo uses.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module QuerySurface (PascalCase of query_surface.pdx stem).
+//   - Pure data (`pub let` only) -> zero encoder pitfalls.
+//   - Every tag fits in u16; sizes fit in u32.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M3-003 +
+// §5.1 / §5.3 (paideia-os monorepo); this repo's #10; frozen
+// PROTOCOL_VERSION tag in src/wire_protocol.pdx.
+
+module QuerySurface = structure {
+
+  // -- Record type tags (frozen at R102-v0) ---------------------------
+  pub let SCC_REC_WINDOW_RECORD_V01           : u64 = 0x0100
+  pub let SCC_REC_DISPLAY_GEOMETRY_V01        : u64 = 0x0101
+  pub let SCC_REC_FOCUS_EVENT_SUMMARY_V01     : u64 = 0x0102
+
+  // -- WindowRecord@0.1 layout (per-row entry in LIST_WINDOWS reply) --
+  pub let SCC_WR_SIZE_BYTES                   : u64 = 48
+  pub let SCC_WR_OFF_TAG                      : u64 = 0    // u16 == SCC_REC_WINDOW_RECORD_V01
+  pub let SCC_WR_OFF_RESERVED_A               : u64 = 2    // u16 pad
+  pub let SCC_WR_OFF_WINDOW_ID                : u64 = 4    // u32
+  pub let SCC_WR_OFF_SCREEN_X                 : u64 = 8    // i32
+  pub let SCC_WR_OFF_SCREEN_Y                 : u64 = 12   // i32
+  pub let SCC_WR_OFF_WIDTH                    : u64 = 16   // u32
+  pub let SCC_WR_OFF_HEIGHT                   : u64 = 20   // u32
+  pub let SCC_WR_OFF_Z_ORDER                  : u64 = 24   // u32
+  pub let SCC_WR_OFF_STATE                    : u64 = 28   // u32
+  pub let SCC_WR_OFF_CLIENT_ENDPT             : u64 = 32   // u64
+  pub let SCC_WR_OFF_RESERVED_B               : u64 = 40   // u64
+
+  // -- DisplayGeometryRecord@0.1 layout (GET_GEOMETRY reply) ----------
+  pub let SCC_DGR_SIZE_BYTES                  : u64 = 32
+  pub let SCC_DGR_OFF_TAG                     : u64 = 0    // u16 == SCC_REC_DISPLAY_GEOMETRY_V01
+  pub let SCC_DGR_OFF_RESERVED_A              : u64 = 2    // u16
+  pub let SCC_DGR_OFF_WIDTH                   : u64 = 4    // u32
+  pub let SCC_DGR_OFF_HEIGHT                  : u64 = 8    // u32
+  pub let SCC_DGR_OFF_PIXEL_FORMAT            : u64 = 12   // u32
+  pub let SCC_DGR_OFF_DPI_HINT                : u64 = 16   // u32
+  pub let SCC_DGR_OFF_STRIDE_BYTES            : u64 = 20   // u32
+  pub let SCC_DGR_OFF_RESERVED_B              : u64 = 24   // u64
+
+  // -- Pixel-format sentinels (DisplayGeometry.pixel_format) ----------
+  pub let SCC_PIX_FMT_BGRA8888                : u64 = 0x0001
+  pub let SCC_PIX_FMT_RGBA8888                : u64 = 0x0002
+
+  // -- FocusEventSummary@0.1 layout (GET_FOCUS second half) -----------
+  pub let SCC_FES_SIZE_BYTES                  : u64 = 24
+  pub let SCC_FES_OFF_TAG                     : u64 = 0    // u16
+  pub let SCC_FES_OFF_RESERVED_A              : u64 = 2    // u16
+  pub let SCC_FES_OFF_FOCUSED_WINDOW_ID       : u64 = 4    // u32
+  pub let SCC_FES_OFF_LAST_FOCUS_TICK         : u64 = 8    // u64
+  pub let SCC_FES_OFF_FOCUS_CHANGE_COUNT      : u64 = 16   // u64
+
+  // -- Reply header layout (every query reply carries this first) -----
+  pub let SCC_QRH_SIZE_BYTES                  : u64 = 16
+  pub let SCC_QRH_OFF_STATUS                  : u64 = 0    // u32
+  pub let SCC_QRH_OFF_RECORD_COUNT            : u64 = 4    // u32
+  pub let SCC_QRH_OFF_PAYLOAD_BYTES           : u64 = 8    // u64
+
+  // Reply-cap: any LIST_WINDOWS reply is truncated at this count. Same
+  // cap as SCC_MAX_WINDOWS in window_table.pdx.
+  pub let SCC_QUERY_MAX_RECORDS               : u64 = 256
+
+}

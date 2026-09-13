@@ -1,0 +1,46 @@
+// tests/probe_window_table.pdx -- svc-compositor v1.1.0 (Wave Y: R102.M2-002 / #5)
+// ProbeWindowTable: honest-witness for the M2-002 window table +
+// Z-order closer. Publishes the fingerprint issue #5 names to fd 1.
+//
+// Substrate landed at v1.1.0 as pure `pub let` constants in
+// src/window_table.pdx: 64-byte window-row layout (window_id,
+// surface_slot, screen_pos, dims, z_order, state, damage_ring ptr +
+// len + cap), state sentinels, Z-order range [0, 0xFFFF],
+// SCC_MAX_WINDOWS = 256. What is deferred is the ACTIVE row-store
+// path (WM_PLACE_WINDOW handler that updates screen_pos + z_order in
+// place, plus the sort-by-z-order pass the render loop consumes) --
+// both need the render-loop's HPET substrate (paideia-os pdxclock
+// M2-002) live.
+//
+// paideia-as encoder notes: identical shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_win_`.
+
+module ProbeWindowTable = structure {
+
+  pub let probe_win_fp     : [u8; 32] = "svc-compositor window-table ok\n\0"
+  pub let probe_win_fp_len : u64      = 31
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M2-002 (#5): ProbeWindowTable::run honest-witness. rdi=1, rsi=lea [rip+probe_win_fp], rdx=31, rax=1 (sys_write), syscall. `cmp rax, 0; jl probe_win_fail`. Success: xor rax, rax; ret. Failure: mov rax, 1; ret. No `test`, no `and rN, imm64`, no byte-register mov. Labels prefixed probe_win_.",
+      block: {
+        mov rdi, 1;
+        lea rsi, [rip + probe_win_fp];
+        mov rdx, 31;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_win_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_win_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

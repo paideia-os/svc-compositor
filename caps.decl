@@ -1,0 +1,62 @@
+# caps.decl -- svc-compositor v1.1.0 (Wave Y drain: R102.M1-002 / #2)
+#
+# Capability declaration for the compositor service.
+#
+# This file is the manifest kernel-side svc_broker + loader-hand-off
+# consult to decide (a) which cap kinds this ELF is allowed to hold,
+# (b) which named IPC endpoints it registers, and (c) the frozen wire
+# protocol version any client library must speak to talk to it. The
+# format is line-oriented, `key = value`, `#` comment lines ignored;
+# same shape every R100 satellite in this org ships (rm's, cp's,
+# mkfs.pdxfs's caps.decl are the worked precedent).
+#
+# Upstream: design/graphics/r102-user-plan.md §4.4 R102.M1-002 in the
+# paideia-os monorepo.
+
+service.name         = svc.compositor
+service.wave         = R102
+protocol.version     = R102-v0
+
+# ------------------------------------------------------------------
+# Capability kinds this service HOLDS
+# ------------------------------------------------------------------
+# KIND_FB_SCANOUT: the framebuffer scanout cap. One-and-only-one
+#   holder org-wide (single-compositor by construction). Kernel mints
+#   at loader-hand-off; compositor's crash-cascade path (R101 §7.2.4)
+#   revokes on exit. Stub-declared here at M1-002; the real cap wire
+#   lands at M3-001 (#8).
+cap.holds            = KIND_FB_SCANOUT
+
+# ------------------------------------------------------------------
+# IPC endpoints this service REGISTERS on svc_broker
+# ------------------------------------------------------------------
+# Client subscription endpoint -- clients call SUBSCRIBE_WINDOW here.
+endpoint.register    = svc.compositor.client
+# Window-manager control endpoint -- WM_PLACE_WINDOW / WM_SET_FOCUS.
+endpoint.register    = svc.compositor.wm
+# Broker registration endpoint -- svc_broker's own back-channel.
+endpoint.register    = svc.compositor.broker
+# Query surface endpoint -- read-only introspection (M3-003 / #10).
+endpoint.register    = svc.compositor.query
+
+# ------------------------------------------------------------------
+# Frozen wire request codes (R102-v0)
+# ------------------------------------------------------------------
+# Numeric ordinals FROZEN at v1.1.0. Any renumbering ships as R102-v1
+# on a new protocol.version line + a corresponding wave/major bump.
+# Same ordinals are re-emitted as `pub let SCC_REQ_*` constants in
+# src/wire_protocol.pdx for compile-time reference from linked code.
+request.SUBSCRIBE_WINDOW        = 0x01
+request.COMMIT_SURFACE          = 0x02
+request.WM_PLACE_WINDOW         = 0x10
+request.WM_SET_FOCUS            = 0x11
+request.QUERY_LIST_WINDOWS      = 0x20
+request.QUERY_GET_FOCUS         = 0x21
+request.QUERY_GET_GEOMETRY      = 0x22
+request.QUERY_SCREENSHOT_REGION = 0x23
+
+# ------------------------------------------------------------------
+# Sentinel reply codes
+# ------------------------------------------------------------------
+reply.OK                        = 0x00
+reply.SCREENSHOT_TOO_LARGE      = 0xE0

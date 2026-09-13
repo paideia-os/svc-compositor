@@ -1,0 +1,74 @@
+// src/screenshot_query.pdx -- svc-compositor v1.1.0 (Wave Y: R102.M3-004 / #11)
+// ScreenshotQuery module: SCREENSHOT_REGION record layout + clamp
+// constants + oversized sentinel.
+//
+// Purpose
+// -------
+// QUERY_SCREENSHOT_REGION (SCC_REQ_QUERY_SCREENSHOT_REGION = 0x23 in
+// wire_protocol.pdx) returns a pixel-region record: header (x, y, w,
+// h, pixel_format, digest) + BGRA payload bytes. Region is clamped
+// to scanout dims; oversized requests reply SCC_REPLY_SCREENSHOT_TOO_LARGE
+// (0xE0) instead of allocating.
+//
+// The record layout + sentinel constants ship live at this closer.
+// The active handler body (readback from the KIND_FB_SCANOUT cap +
+// BLAKE3 digest of the payload) lands at its own closer once the
+// M3-001 real cap is live. The probe witness at
+// tests/probe_screenshot.pdx publishes the acceptance fingerprint on
+// the same shape every honest-witness driver in this repo uses.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ScreenshotQuery (PascalCase of screenshot_query.pdx stem).
+//   - Pure data (`pub let` only) -> zero encoder pitfalls.
+//   - Every offset + limit fits in u32; each is exposed at u64 for
+//     the pointer-arithmetic dispatch that will read the record.
+//   - Digest field is BLAKE3-256 = 32 bytes fixed.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M3-004 +
+// §5.4 (paideia-os monorepo); this repo's #11.
+
+module ScreenshotQuery = structure {
+
+  // -- Request record layout (client -> compositor) -------------------
+  pub let SCC_SSQ_REQ_SIZE_BYTES        : u64 = 24
+  pub let SCC_SSQ_REQ_OFF_TAG           : u64 = 0    // u16
+  pub let SCC_SSQ_REQ_OFF_RESERVED_A    : u64 = 2    // u16
+  pub let SCC_SSQ_REQ_OFF_X             : u64 = 4    // i32
+  pub let SCC_SSQ_REQ_OFF_Y             : u64 = 8    // i32
+  pub let SCC_SSQ_REQ_OFF_WIDTH         : u64 = 12   // u32
+  pub let SCC_SSQ_REQ_OFF_HEIGHT        : u64 = 16   // u32
+  pub let SCC_SSQ_REQ_OFF_RESERVED_B    : u64 = 20   // u32
+
+  // -- Reply header layout (compositor -> client) ---------------------
+  // Header is fixed 64 bytes; payload of `width * height * 4` BGRA
+  // bytes follows in the SAME reply buffer.
+  pub let SCC_SSQ_HDR_SIZE_BYTES        : u64 = 64
+  pub let SCC_SSQ_HDR_OFF_STATUS        : u64 = 0    // u32 (0 = ok, 0xE0 = too-large)
+  pub let SCC_SSQ_HDR_OFF_TAG           : u64 = 4    // u16
+  pub let SCC_SSQ_HDR_OFF_PIXEL_FORMAT  : u64 = 6    // u16 (BGRA8888)
+  pub let SCC_SSQ_HDR_OFF_X             : u64 = 8    // i32 (clamped)
+  pub let SCC_SSQ_HDR_OFF_Y             : u64 = 12   // i32 (clamped)
+  pub let SCC_SSQ_HDR_OFF_WIDTH         : u64 = 16   // u32 (clamped)
+  pub let SCC_SSQ_HDR_OFF_HEIGHT        : u64 = 20   // u32 (clamped)
+  pub let SCC_SSQ_HDR_OFF_STRIDE_BYTES  : u64 = 24   // u32
+  pub let SCC_SSQ_HDR_OFF_PAYLOAD_BYTES : u64 = 28   // u32
+  pub let SCC_SSQ_HDR_OFF_DIGEST        : u64 = 32   // [u8;32] BLAKE3-256
+
+  // -- Record tag (ties reply to schema version) ----------------------
+  pub let SCC_SSQ_TAG_V01               : u64 = 0x0200
+
+  // -- Clamp / sentinel constants -------------------------------------
+  // Any single dimension larger than this is rejected outright
+  // (before clamping) with SCREENSHOT_TOO_LARGE. Cap chosen to bound
+  // a single reply's payload to 64 MiB (4096 * 4096 * 4 B/pixel).
+  pub let SCC_SSQ_MAX_DIM_PIXELS        : u64 = 4096
+  // Absolute upper bound on payload bytes (4096 * 4096 * 4).
+  pub let SCC_SSQ_MAX_PAYLOAD_BYTES     : u64 = 67108864
+  pub let SCC_SSQ_BYTES_PER_PIXEL       : u64 = 4
+
+  // -- Status sentinels (aliases of wire_protocol.pdx reply codes) ----
+  pub let SCC_SSQ_STATUS_OK             : u64 = 0x00
+  pub let SCC_SSQ_STATUS_TOO_LARGE      : u64 = 0xE0
+
+}

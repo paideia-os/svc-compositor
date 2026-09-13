@@ -37,10 +37,15 @@ that repo) uses for its own still-stubbed timeout path.
 
 | Driver                        | Fingerprint          | Bytes | Issue |
 | ----------------------------- | -------------------- | ----- | ----- |
-| `boot_r102_first_pixel.pdx`   | `first pixel ok\n`   | 15    | #12   |
-| `boot_r102_window_present.pdx`| `window present ok\n`| 18    | #13   |
-| `boot_r102_input_route.pdx`   | `input route ok\n`   | 15    | #14   |
-| `boot_r102_screenshot.pdx`    | `screenshot ok\n`    | 14    | #15   |
+| `boot_r102_first_pixel.pdx`   | `first pixel ok\n`                       | 15    | #12   |
+| `boot_r102_window_present.pdx`| `window present ok\n`                    | 18    | #13   |
+| `boot_r102_input_route.pdx`   | `input route ok\n`                       | 15    | #14   |
+| `boot_r102_screenshot.pdx`    | `screenshot ok\n`                        | 14    | #15   |
+| `probe_wire_protocol.pdx`     | `svc-compositor wire-protocol frozen ok\n` | 39    | #2    |
+| `probe_accept_loop.pdx`       | `svc-compositor accept-loop ok\n`        | 30    | #3    |
+| `probe_window_table.pdx`      | `svc-compositor window-table ok\n`       | 31    | #5    |
+| `probe_query.pdx`             | `svc-compositor query ok\n`              | 24    | #10   |
+| `probe_screenshot.pdx`        | `svc-compositor screenshot ok\n`         | 29    | #11   |
 
 ## Return-code convention (org-wide)
 

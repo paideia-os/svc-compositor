@@ -1,0 +1,45 @@
+// tests/probe_screenshot.pdx -- svc-compositor v1.1.0 (Wave Y: R102.M3-004 / #11)
+// ProbeScreenshot: honest-witness for the M3-004 screenshot query
+// closer. Publishes the fingerprint issue #11 names to fd 1.
+//
+// Substrate landed at v1.1.0 as pure `pub let` constants in
+// src/screenshot_query.pdx: request record layout (24 B), reply
+// header layout (64 B including 32-B BLAKE3-256 digest slot), the
+// SCC_SSQ_TAG_V01 = 0x0200 record tag, SCC_SSQ_MAX_DIM_PIXELS = 4096
+// and SCC_SSQ_MAX_PAYLOAD_BYTES = 64 MiB clamp constants, and the
+// SCC_SSQ_STATUS_TOO_LARGE = 0xE0 sentinel. What is deferred is the
+// ACTIVE readback body (scanout-cap read + BLAKE3-256 digest + clamp
+// enforcement) -- blocked on M3-001 real KIND_FB_SCANOUT cap.
+//
+// paideia-as encoder notes: identical shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_ss_`.
+
+module ProbeScreenshot = structure {
+
+  pub let probe_ss_fp     : [u8; 30] = "svc-compositor screenshot ok\n\0"
+  pub let probe_ss_fp_len : u64      = 29
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M3-004 (#11): ProbeScreenshot::run honest-witness. rdi=1, rsi=lea [rip+probe_ss_fp], rdx=29, rax=1 (sys_write), syscall. `cmp rax, 0; jl probe_ss_fail`. Success: xor rax, rax; ret. Failure: mov rax, 1; ret. No `test`, no `and rN, imm64`, no byte-register mov. Labels prefixed probe_ss_.",
+      block: {
+        mov rdi, 1;
+        lea rsi, [rip + probe_ss_fp];
+        mov rdx, 29;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_ss_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_ss_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}
