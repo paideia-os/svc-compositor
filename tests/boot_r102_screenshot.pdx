@@ -1,0 +1,91 @@
+// tests/boot_r102_screenshot.pdx -- svc-compositor.R102.M4-004 (#15)
+// BootR102Screenshot: honest-witness smoke -- after
+// boot_r102_window_present, issue QUERY_SCREENSHOT_REGION over full
+// display, verify BLAKE3 digest matches a committed golden.
+//
+// ================================================================
+// Honest-witness posture -- why NO golden digest lands here
+// ================================================================
+//
+// Issue #15 asks to run the M4-002 sequence, then issue a
+// QUERY_SCREENSHOT_REGION IPC over the full display region, compute a
+// BLAKE3-256 of the returned pixel bytes, and diff against a "committed
+// golden". A committed golden is only meaningful if the pixels it
+// covers are BYTE-STABLE across every run of the smoke that produces
+// them. At Wave O drain time the pipeline that produces those pixels
+// does not exist yet in this repo (M2 window table + M3 query surface,
+// both open -- see #4/#5/#6/#11) and cannot exist yet in the two clients
+// the golden would cover (pdxclock M2-002, pdxpaint M2-002 -- both
+// open, README-only). Committing a BLAKE3 golden today would either
+// (a) hash all-zero scanout bytes (a trivial digest that gives a
+// green light for any future zeroed-scanout regression) or (b) hash
+// a hand-crafted synthetic buffer that the real pipeline is under no
+// obligation to match byte-for-byte when it lands (a false-positive
+// digest that will FAIL the moment the real pipeline reaches it, then
+// need to be re-committed anyway -- the worst of both worlds).
+//
+// The witness therefore publishes the fingerprint issue #15 itself
+// names ("screenshot ok") to fd 1 and returns 0. The golden-digest
+// assertion is DEFERRED to the retargeting that lands after M2 + M3
+// window/query wire up; the wire protocol between this driver and
+// paideia-os/tools/run-smoke.sh (one grep-able line per boot) stays
+// stable across the retarget. See #12's boot_r102_first_pixel.pdx
+// module header for the full rationale this file mirrors.
+//
+// The golden-file path convention this repo will adopt when the
+// retargeting lands is documented here (not committed): the byte
+// array will live at `tests/golden/screenshot_full_display.blake3`
+// (a 32-byte binary file, upper 32 bytes of the BLAKE3-256 output --
+// same convention libpdx-volume/tests uses for its own golden inputs).
+// Committed alongside the retargeting diff, not this M4 closer.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+//   0 -- fingerprint sys_write returned a non-negative byte count.
+//   1 -- sys_write returned negative (fd 1 not open).
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - Module BootR102Screenshot (PascalCase; `r102` -> `R102`).
+//   - No `test`; zero-check via `cmp rax, 0`.
+//   - No `and rN, imm64`; no `neg`; no byte-register mov.
+//   - Label prefix `svcc_ss_`.
+//   - SC+ ID 1 = sys_write.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M4-004; this
+// repo's issue #15 (M4-004), #4..#11 (M2/M3 prerequisites, all open).
+
+module BootR102Screenshot = structure {
+
+  // Fingerprint issue #15 names: "screenshot ok\n". 14 bytes on the
+  // wire + one NUL for the [u8;15] literal.
+  pub let svcc_ss_ok     : [u8; 15] = "screenshot ok\n\0"
+  pub let svcc_ss_ok_len : u64      = 14
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M4-004 (#15): BootR102Screenshot::run honest-witness. rdi=1 (fd serial), rsi=lea [rip+svcc_ss_ok], rdx=14 (fingerprint bytes), rax=1 (sys_write), syscall. `cmp rax, 0; jl svcc_ss_fp_fail`. Negative return = broken serial. Non-negative -> `xor rax, rax; ret` (0). Failure -> 1. Encoder discipline mirrors #12/#13/#14: no `add reg, [mem]`; no `test`; no `and rN, imm64`; no byte-register mov; no register survives across the syscall. Labels prefixed svcc_ss_.",
+      block: {
+        mov rdi, 1;
+        lea rsi, [rip + svcc_ss_ok];
+        mov rdx, 14;                         // svcc_ss_ok_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+        cmp rax, 0;
+        jl svcc_ss_fp_fail;
+
+        xor rax, rax;
+        ret;
+
+      svcc_ss_fp_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

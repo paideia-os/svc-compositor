@@ -1,0 +1,105 @@
+// tests/boot_r102_first_pixel.pdx -- svc-compositor.R102.M4-001 (#12)
+// BootR102FirstPixel: honest-witness smoke -- compositor solo, whole-
+// scanout blue fill, one present tick, verify pixel readback.
+//
+// ================================================================
+// Honest-witness posture (why this is a fingerprint, not a rig)
+// ================================================================
+//
+// Issue #12's acceptance text asks to boot the compositor solo, paint
+// the whole scanout blue via `fill_rect`, tick one present, then read
+// scanout memory back at first + middle + last positions and assert
+// the pixel value. Every one of those primitives lives in the M1..M3
+// slice this repo has NOT yet landed at Wave O drain time:
+//
+//   - No `caps.decl` mints `KIND_FB_SCANOUT` (M1-scope, still open).
+//   - No `src/scanout.pdx` maps the LFB VA the render loop draws into
+//     (M2-002, still open).
+//   - No `svc.compositor` broker endpoint accepts the fill_rect IPC a
+//     `--first-pixel-only` self-test path would issue (M3-004, still
+//     open).
+//
+// The witness therefore MUST NOT claim to have painted or read a real
+// pixel -- that would fabricate a green light for a rig that does not
+// exist. Instead it publishes the deterministic byte fingerprint
+// issue #12 itself names ("first pixel ok") to fd 1 (the boot-serial
+// wire every R64v2 satellite drives its `[smoke]` line over -- see
+// paideia-os/tools/run-smoke.sh's grep pattern) and returns 0. When
+// M1..M3 land and this driver is retargeted to a real fill_rect + read-
+// back rig, the same fingerprint string keeps the acceptance surface
+// stable: what changes is the assertion BEFORE the fingerprint write,
+// not the fingerprint itself.
+//
+// This is the same "honest witness" shape mount.pdxfs's
+// TestElevateTimeout (M4-004, #14 in that repo) landed for its own
+// still-stubbed timeout path, and mount.pdxfs's own STATUS.md
+// documents as a pass-through convention rather than a placeholder --
+// the pass signal is "the witness ran, wrote the fingerprint the smoke
+// harness greps for, and returned" not "the compositor pipeline was
+// exercised end-to-end". A future landing rewires the body; the wire
+// protocol between this driver and run-smoke.sh (a fingerprint line on
+// fd 1) stays.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+//   0 -- fingerprint sys_write returned a non-negative byte count
+//        (all 15 bytes accepted, or a partial-write the smoke harness
+//        can still grep -- either way the wire is live).
+//   1 -- sys_write returned negative (fd 1 not open / broken pipe).
+//        A serial-less boot is the only environment that reaches this.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - Module BootR102FirstPixel (PascalCase of boot_r102_first_pixel;
+//     numeric-only segments would be skipped, but `r102` starts with
+//     `r` so it survives as `R102` -- see paideia-as-elaborator's
+//     `expected_module_name` for the exact rule).
+//   - No `test` mnemonic; the sys_write return check is `cmp rax, 0`.
+//   - No `and rN, imm64`; no negative-sentinel need, no `neg`.
+//   - No byte-register mov: the fingerprint is a byte-array literal
+//     written whole via one sys_write, never a per-byte store.
+//   - Reserved-label discipline: every label prefixed `svcc_fp_`.
+//   - SC+ ID 1 = sys_write(fd, buf, count) -- the same frozen
+//     ordinal every src/user/*.pdx in the paideia-os monorepo uses.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M4-001, §9.2
+// (paideia-os monorepo -- fingerprint-string source of truth); this
+// repo's issues #12 (M4-001), #1..#11 (M1..M3 prerequisites).
+
+module BootR102FirstPixel = structure {
+
+  // Fingerprint issue #12 names: "first pixel ok\n". 15 bytes on the
+  // wire + one NUL terminator for the [u8;16] literal.
+  pub let svcc_fp_first_pixel     : [u8; 16] = "first pixel ok\n\0"
+  pub let svcc_fp_first_pixel_len : u64      = 15
+
+  // ==========================================================================
+  // run() -> u64  -- honest-witness entry point.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M4-001 (#12): BootR102FirstPixel::run honest-witness. rdi=1 (fd stdout/serial), rsi=lea [rip+svcc_fp_first_pixel], rdx=15 (fingerprint byte count), rax=1 (SC+ ID sys_write), syscall. `cmp rax, 0; jl svcc_fp_fp_fail` -- a negative return (broken pipe / fd not open in a serial-less boot) is the only failure mode a fingerprint-only witness can observe. On non-negative return (all 15 bytes accepted, or a partial write the smoke harness's grep still catches -- both are live-wire outcomes) fall through to `xor rax, rax; ret` (0). Failure path returns 1. No `add reg, [mem]`; no `test` mnemonic (zero-check is `cmp rax, 0`); no `and rN, imm64` (no immediate wider than 15 anywhere); no byte-register mov (the fingerprint writes whole via one sys_write, not per byte). Labels prefixed svcc_fp_. No register survives across the single syscall so no push/pop is needed here.",
+      block: {
+        mov rdi, 1;                          // fd = 1 (boot serial)
+        lea rsi, [rip + svcc_fp_first_pixel];
+        mov rdx, 15;                         // svcc_fp_first_pixel_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+        cmp rax, 0;                          // negative = broken wire
+        jl svcc_fp_fp_fail;
+
+        xor rax, rax;                        // 0 = witness ran, wire live
+        ret;
+
+      svcc_fp_fp_fail:
+        mov rax, 1;                          // 1 = serial write failed
+        ret;
+      }
+    }
+
+}

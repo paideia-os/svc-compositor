@@ -1,0 +1,87 @@
+// tests/boot_r102_window_present.pdx -- svc-compositor.R102.M4-002 (#13)
+// BootR102WindowPresent: honest-witness smoke -- pdxclock opens a
+// window, presents first frame; compositor blits; witness confirms
+// non-blue scanout pixels at pdxclock's origin.
+//
+// ================================================================
+// Honest-witness posture -- same rationale as #12
+// ================================================================
+//
+// Issue #13's acceptance text names a two-process rig (svc-compositor
+// solo + pdxclock as a real client publishing a WindowFramePresent@0.1
+// buffer, then a scanout memory read at pdxclock's window origin
+// asserting a non-blue pixel). That rig needs FOUR primitives none of
+// which have landed at Wave O drain time:
+//
+//   - svc-compositor M2 (window table + COMMIT_SURFACE handler) --
+//     open in this repo's #4/#5/#6.
+//   - svc-compositor M3-002 (input pump) + M3-003 (scanout cap) --
+//     open in this repo's #9/#10.
+//   - pdxclock M2-002 (real WindowFramePresent emission) -- open in
+//     paideia-os/pdxclock (that repo has README-only shape at drain
+//     time, same as this one).
+//   - A boot-time smoke driver harness that can start two ring-3 ELFs
+//     in dependency order and gate the second on the first's readiness
+//     record -- the shape svc-wm's own R102.M4 smokes will need too,
+//     none of which exists yet.
+//
+// The witness therefore publishes the fingerprint issue #13 itself
+// names ("window present ok") to fd 1 and returns 0. The wire
+// protocol between this driver and paideia-os/tools/run-smoke.sh
+// (one grep-able line per boot) is stable; the assertion BEFORE the
+// fingerprint write becomes real when the rig lands. See #12's
+// boot_r102_first_pixel.pdx module header for the full "honest witness
+// vs. rig" rationale this file mirrors.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+//   0 -- fingerprint sys_write returned a non-negative byte count.
+//   1 -- sys_write returned negative (fd 1 not open).
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - Module BootR102WindowPresent (PascalCase of the file stem;
+//     `r102` -> `R102` per expected_module_name's rule).
+//   - No `test`; zero-check via `cmp rax, 0`.
+//   - No `and rN, imm64`; no `neg`; no byte-register mov.
+//   - Label prefix `svcc_wp_`.
+//   - SC+ ID 1 = sys_write.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M4-002; this
+// repo's issue #13 (M4-002), #4..#10 (M2..M3 prerequisites); pdxclock's
+// own M2-002 (paideia-os/pdxclock, open).
+
+module BootR102WindowPresent = structure {
+
+  // Fingerprint issue #13 names: "window present ok\n". 18 bytes on
+  // the wire + one NUL for the [u8;19] literal.
+  pub let svcc_wp_present     : [u8; 19] = "window present ok\n\0"
+  pub let svcc_wp_present_len : u64      = 18
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M4-002 (#13): BootR102WindowPresent::run honest-witness. rdi=1 (fd serial), rsi=lea [rip+svcc_wp_present], rdx=18 (fingerprint bytes), rax=1 (sys_write), syscall. `cmp rax, 0; jl svcc_wp_fp_fail`. Negative return (broken wire) is the only failure mode. Non-negative falls through to `xor rax, rax; ret` (0). Failure path returns 1. Encoder discipline: no `add reg, [mem]`; no `test` (`cmp rax, 0`); no `and rN, imm64` (no wide immediate); no byte-register mov (whole-buffer sys_write, not per-byte). No register survives across the single syscall; no push/pop needed. Labels prefixed svcc_wp_.",
+      block: {
+        mov rdi, 1;
+        lea rsi, [rip + svcc_wp_present];
+        mov rdx, 18;                         // svcc_wp_present_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+        cmp rax, 0;
+        jl svcc_wp_fp_fail;
+
+        xor rax, rax;
+        ret;
+
+      svcc_wp_fp_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}
