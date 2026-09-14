@@ -46,6 +46,7 @@ that repo) uses for its own still-stubbed timeout path.
 | `probe_window_table.pdx`      | `svc-compositor window-table ok\n`       | 31    | #5    |
 | `probe_query.pdx`             | `svc-compositor query ok\n`              | 24    | #10   |
 | `probe_screenshot.pdx`        | `svc-compositor screenshot ok\n`         | 29    | #11   |
+| `probe_input_pump.pdx`        | `svc-compositor input-pump ok\n`         | 29    | #9    |
 
 ## Return-code convention (org-wide)
 

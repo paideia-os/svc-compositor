@@ -1,0 +1,421 @@
+// src/input_pump.pdx -- svc-compositor v1.3.0 (Wave III: R102.M3-002 / #9)
+// InputPump module: input-event routing over the R101 focus channel.
+//
+// ================================================================
+// Scope (per issue #9 / design/graphics/r102-user-plan.md §4.4
+// R102.M3-002)
+// ================================================================
+//
+// Subscribes to the R101 focus-routed input channel (svc.input,
+// resolved via sys_svc_lookup, SC+ ID 43) and forwards each
+// InputEventRecord@0.1 (§5.2) to the currently focused window's
+// subscribed client via sys_ipc_send (SC+ ID 42).
+//
+// ---- Honest-scope notes ----
+//
+// 1. **FocusCache is a LOCAL MIRROR, per the issue's own text**
+//    ("Focused surface id read from FocusCache (from libpdx-event or
+//    a local mirror)"). libpdx-event's real FocusCache
+//    (design/graphics/r102-user-plan.md §4.3 R102.M2-004) is not yet
+//    linkable from this satellite repo -- the same class of gap
+//    scanout.pdx (#4) and commit.pdx (#7) each document for their own
+//    dependencies. `focus_cache_set` is exposed so whichever WM_SET_FOCUS
+//    handler lands next (src/wire_protocol.pdx's SCC_REQ_WM_SET_FOCUS =
+//    0x11 is already frozen, but no active handler body exists yet --
+//    see window_table.pdx / query_surface.pdx's own "active body
+//    deferred" notes) can populate it. Until then it defaults to
+//    IP_FOCUS_NONE and every polled event is honestly dropped rather
+//    than mis-routed to window id 0.
+//
+// 2. **The per-window client-endpoint table is this module's own
+//    self-contained mirror**, not a read of broker_accept.pdx's
+//    SCC_ROW_* row layout. broker_accept.pdx's own header states
+//    plainly that "no row storage is actually allocated yet" at this
+//    wave -- the same reason commit.pdx (#7) built its own
+//    self-contained damage table instead of depending on
+//    window_table.pdx's unallocated row-store. `input_pump_register_client`
+//    is this closer's registration entry point; a future closer that
+//    lands the real accept-loop row-store should reconcile the two
+//    (noted in STATUS.md, matching commit.pdx's own forward note).
+//
+// 3. **The raw svc.input wire format is treated as an opaque 64-byte
+//    buffer already shaped like InputEventRecord@0.1**, with exactly
+//    ONE field this pump does not trust from the raw channel:
+//    `window_id` (offset +0). Routing authority belongs to the
+//    compositor (which alone knows the true focused window), not the
+//    raw HID source, so `input_pump_stamp_and_route` unconditionally
+//    overwrites offset +0 with the FocusCache's current value before
+//    a delivery decision is made. Every other field (event_type,
+//    keycode, modifiers, pointer_x/y, pointer_button, ts_ns) passes
+//    through verbatim.
+//
+// ---- InputEventRecord@0.1, as routed here (§5.2) ----
+//
+// The spec's sub-word fields (event_type enum, keycode u32,
+// modifiers u8, pointer_x/y i32, pointer_button u8) are each widened
+// to a full u64 store here, the identical widening convention
+// render_loop.pdx's PresentRecord@0.1 already uses ("every field is a
+// plain 8-byte store -- no sub-word packing"). Eight u64 fields *
+// 8 bytes = exactly the 64-byte record size issue #9 names. ts_ns's
+// spec width is i128; only the low 64 bits are carried at this
+// closer (identical deferral rationale to render_loop.pdx's own
+// PresentRecord.ts_ns note -- ns-since-boot is non-negative and fits
+// u64 for centuries).
+//
+//   +0  window_id       u64   overwritten from FocusCache, never trusted
+//                              from the raw channel
+//   +8  event_type      u64
+//   +16 keycode         u64
+//   +24 modifiers       u64
+//   +32 pointer_x       u64
+//   +40 pointer_y       u64
+//   +48 pointer_button  u64
+//   +56 ts_ns           u64   (low 64 bits only, see above)
+//
+//   total: 64 bytes.
+//
+// ---- Wire header for the outbound delivery ----
+//
+// The 8-byte IPC header (design/ipc/userspace-server-substrate.md
+// §4.1: op:u8 | ver:u8 | flags/reply_endpoint_id:u16 | payload_len:u32)
+// needs an `op` value for this one-way compositor-to-client delivery.
+// Every ordinal in [0x01, 0x23] is already FROZEN by wire_protocol.pdx
+// for CLIENT/WM/QUERY-issued requests; this is a distinct direction
+// (compositor-issued, not client-issued), so it is minted at 0x40 --
+// outside that range, mirroring how WM_* (0x10) and QUERY_* (0x20)
+// each claimed their own decade. `ver` is 0 (numeric R102-v0, matching
+// WireProtocol.PROTOCOL_VERSION's textual "R102-v0"). `flags` (this
+// header's reply_endpoint_id slot per §4.4's compact-variant reuse)
+// is 0 -- this is a one-way delivery, not a request expecting a reply
+// on a named reply endpoint.
+//
+// ================================================================
+// Entry points
+// ================================================================
+//
+//   * input_pump_init() -> u64
+//       Resets every table slot to the "unregistered" sentinel,
+//       resets FocusCache to IP_FOCUS_NONE, and resolves the
+//       svc.input endpoint via sys_svc_lookup. Returns the raw
+//       svc_lookup result verbatim (slot id in [0..255] on success,
+//       or its pass-through negative errno -- see
+//       sys_svc_lookup.pdx's own taxonomy: -EINVAL/-EFAULT/-ENOENT/
+//       -ENOSPC). A live svc.input broker registration is a Wave III
+//       cross-repo dependency this closer does not itself land, so
+//       -ENOENT here is an expected, honest outcome until that
+//       registration exists.
+//
+//   * focus_cache_set(window_id) -> u64 / focus_cache_get() -> u64
+//       FocusCache mirror accessors (see honest-scope note 1 above).
+//
+//   * input_pump_register_client(window_id, client_endpoint) -> u64
+//       Registers window_id's owning client endpoint in this
+//       module's self-contained table (see honest-scope note 2
+//       above). IP_ERR_BAD_WINDOW if window_id >= IP_MAX_WINDOWS.
+//
+//   * input_pump_stamp_and_route(payload_ptr) -> u64
+//       Pure, syscall-free routing decision: stamps FocusCache's
+//       window id into payload_ptr+0, then resolves that window's
+//       client endpoint from the local table. Returns the resolved
+//       endpoint (< 256) on success, or one of IP_ERR_NO_FOCUS /
+//       IP_ERR_BAD_WINDOW / IP_ERR_NO_CLIENT (each a huge-unsigned
+//       sentinel, uniformly discriminated from a real endpoint by a
+//       single `cmp rax, 256; jae` per sys_svc_lookup.pdx's own
+//       slot-vs-errno discrimination convention). Split out from
+//       input_pump_deliver_event specifically so a probe witness can
+//       exercise the real routing logic without depending on a live
+//       svc.input broker or a live client endpoint (tests/probe_input_pump.pdx).
+//
+//   * input_pump_deliver_event(payload_ptr) -> u64
+//       Thin wrapper: calls input_pump_stamp_and_route; on a
+//       resolved endpoint, builds the outbound header and issues
+//       sys_ipc_send; on any routing error, returns it unchanged
+//       (drop -- forwarding to nobody is a documented no-op, not a
+//       crash, matching commit.pdx's error-sentinel-not-fault style).
+//
+// ================================================================
+// paideia-as compliance
+// ================================================================
+//   - Module InputPump (PascalCase of input_pump.pdx stem).
+//   - No `test rN, rN`; no `and rN, imm64`; no 2-op `imul r, imm`
+//     (no multiply anywhere in this file); no byte-register alias.
+//   - No `add reg, [mem]` -- every memory operand staged through a
+//     register first.
+//   - `[reg + reg*8 + disp]` triple-form addressing proven at
+//     fs/fd_table.pdx L22/L36/L54 (same precedent commit.pdx cites).
+//   - 64-bit sentinel comparisons stage the literal through a
+//     register first (`mov r10, 0xFFFF...; cmp rN, r10`) rather than
+//     relying on any implicit imm64 compare form.
+//   - Reserved-label discipline: labels prefixed `ip_`.
+//   - input_pump_deliver_event's 2-push prologue (r12/r13) before its
+//     nested `call input_pump_stamp_and_route` mirrors render_loop.pdx's
+//     render_loop_tick shipped push discipline verbatim (same repo,
+//     same precedent) rather than the 5-push/odd-push alignment math
+//     sys_svc_lookup_body documents -- no SSE/aligned-load instruction
+//     is used anywhere in this tree, so no functional dependency on
+//     16-byte stack alignment exists at this landing.
+//   - Module-let constants used in cmp/mov are inlined as literals
+//     where the encoder needs them (256 for IP_MAX_WINDOWS, 64 for
+//     IER_SIZE_BYTES, 0x40 for the delivery op), each with a naming
+//     comment, per this repo's established discipline.
+//
+// Upstream: design/graphics/r102-user-plan.md §4.4 R102.M3-002, §5.2
+// (paideia-os monorepo); design/ipc/userspace-server-substrate.md §4.1
+// (header layout), §4.3 (sys_ipc_send), §5.1 (sysno table); this
+// repo's #9; src/wire_protocol.pdx (frozen request-code range this
+// file's 0x40 op deliberately avoids); src/broker_accept.pdx +
+// src/commit.pdx (self-contained-table precedent).
+
+module InputPump = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  pub let IP_OK                     : u64 = 0
+  pub let IP_ERR_NO_FOCUS           : u64 = 0xFFFFFFFFFFFFFFFB
+  pub let IP_ERR_NO_CLIENT          : u64 = 0xFFFFFFFFFFFFFFFC
+  pub let IP_ERR_BAD_WINDOW         : u64 = 0xFFFFFFFFFFFFFFFD
+  pub let IP_FOCUS_NONE             : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let IP_UNREGISTERED           : u64 = 0xFFFFFFFFFFFFFFFF   // table "empty slot" sentinel
+
+  pub let IP_MAX_WINDOWS            : u64 = 256          // SCC_MAX_WINDOWS, duplicated per encoder discipline
+  pub let IP_OP_DELIVER_INPUT_EVENT : u64 = 0x40         // one-way compositor->client op, outside 0x01-0x23
+  pub let IP_HDR_VER                : u64 = 0            // numeric R102-v0
+
+  // InputEventRecord@0.1 offsets (each field widened to u64; see file header).
+  pub let IER_OFF_WINDOW_ID         : u64 = 0
+  pub let IER_OFF_EVENT_TYPE        : u64 = 8
+  pub let IER_OFF_KEYCODE           : u64 = 16
+  pub let IER_OFF_MODIFIERS         : u64 = 24
+  pub let IER_OFF_POINTER_X         : u64 = 32
+  pub let IER_OFF_POINTER_Y         : u64 = 40
+  pub let IER_OFF_POINTER_BUTTON    : u64 = 48
+  pub let IER_OFF_TS_NS             : u64 = 56
+  pub let IER_SIZE_BYTES            : u64 = 64
+
+  // svc.input broker registration name (16-byte field, NUL-padded;
+  // name_len excludes all padding, per sys_svc_lookup_body's
+  // length-explicit contract -- no NUL required).
+  pub let SVC_INPUT_NAME            : [u8; 16] = "svc.input\0\0\0\0\0\0\0"
+  pub let SVC_INPUT_NAME_LEN        : u64      = 9
+
+  // ==========================================================================
+  // State
+  // ==========================================================================
+
+  pub let mut _ip_input_endpoint_slot : u64        = uninit @align(8)
+  pub let mut _ip_focus_window_id     : u64        = uninit @align(8)    // FocusCache mirror
+  pub let mut _ip_client_endpt_table  : [u64; 256] = uninit @align(64)   // window_id -> client endpoint
+  pub let mut _ip_hdr_scratch         : u64        = uninit @align(8)
+
+  // ==========================================================================
+  // input_pump_init() -> u64
+  //
+  // Register plan: 2 callee-save pushes (r12 = table-init loop index,
+  // r13 = the IP_FOCUS_NONE/IP_UNREGISTERED sentinel, reused for both
+  // the table-fill and the FocusCache reset); no nested call, so
+  // alignment is a non-issue (mirrors commit.pdx's own no-call note).
+  // ==========================================================================
+
+  pub let input_pump_init : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "Wave III R102.M3-002 (#9): InputPump::input_pump_init. Stages the sentinel 0xFFFFFFFFFFFFFFFF once into r13 (mov r64,imm64 -- always-legal encoding, unlike a 64-bit cmp immediate) and fills every _ip_client_endpt_table slot (256 entries, IP_MAX_WINDOWS literal) with it via a `[r11 + r12*8 + 0]` triple-form store loop (proven addressing form, fs/fd_table.pdx). Reuses r13 to reset _ip_focus_window_id to the same sentinel (IP_FOCUS_NONE == IP_UNREGISTERED numerically, by design -- both mean 'nothing here yet'). Then resolves svc.input: lea rdi=&SVC_INPUT_NAME, mov rsi=9 (SVC_INPUT_NAME_LEN), mov rax=43 (SC+ ID sys_svc_lookup), syscall. Publishes rax to _ip_input_endpoint_slot and returns it verbatim (slot id in [0..255] on success, or one of sys_svc_lookup_body's negative-errno sentinels -- -ENOENT is an expected, honest outcome until a live svc.input broker registration exists elsewhere in the tree). 2 callee-save pushes (r12=loop index, r13=sentinel); no nested call. Labels prefixed ip_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r13, 0xFFFFFFFFFFFFFFFF;         // IP_UNREGISTERED / IP_FOCUS_NONE
+        lea r11, [rip + _ip_client_endpt_table];
+        xor r12, r12;                        // i = 0
+
+      ip_init_table_loop:
+        cmp r12, 256;                        // IP_MAX_WINDOWS (literal)
+        jae ip_init_table_done;
+        mov [r11 + r12*8 + 0], r13;
+        add r12, 1;
+        jmp ip_init_table_loop;
+
+      ip_init_table_done:
+        lea r10, [rip + _ip_focus_window_id];
+        mov [r10 + 0], r13;                  // FocusCache = IP_FOCUS_NONE
+
+        lea rdi, [rip + SVC_INPUT_NAME];
+        mov rsi, 9;                          // SVC_INPUT_NAME_LEN
+        mov rax, 43;                         // SC+ ID 43 = sys_svc_lookup
+        syscall;
+
+        lea r10, [rip + _ip_input_endpoint_slot];
+        mov [r10 + 0], rax;
+
+        pop r13;
+        pop r12;
+        ret                                  // rax = sys_svc_lookup's raw result (pass-through)
+      }
+    }
+
+  // ==========================================================================
+  // focus_cache_set(window_id) -> u64
+  // ==========================================================================
+
+  pub let focus_cache_set : (u64) -> u64 !{mem} @{} =
+    fn (window_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R102.M3-002 (#9): InputPump::focus_cache_set. FocusCache LOCAL MIRROR setter (see file header note 1) -- a future WM_SET_FOCUS handler calls this with the newly-focused window id. Straight-line store, no push needed (no nested call, no callee-save register touched).",
+      block: {
+        lea r10, [rip + _ip_focus_window_id];
+        mov [r10 + 0], rdi;
+        xor rax, rax;                        // IP_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // focus_cache_get() -> u64
+  // ==========================================================================
+
+  pub let focus_cache_get : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R102.M3-002 (#9): InputPump::focus_cache_get. Straight-line load of the FocusCache mirror. No push needed.",
+      block: {
+        lea r10, [rip + _ip_focus_window_id];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // input_pump_register_client(window_id, client_endpoint) -> u64
+  // ==========================================================================
+
+  pub let input_pump_register_client : (u64, u64) -> u64 !{mem} @{} =
+    fn (window_id: u64) (client_endpoint: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R102.M3-002 (#9): InputPump::input_pump_register_client. Self-contained window_id -> client-endpoint table (see file header note 2). Gate: window_id >= 256 (IP_MAX_WINDOWS literal) -> IP_ERR_BAD_WINDOW. Otherwise stores client_endpoint at table[window_id] via `[r10 + rdi*8 + 0]` triple-form addressing and returns IP_OK. No push needed (no nested call).",
+      block: {
+        cmp rdi, 256;                        // IP_MAX_WINDOWS (literal)
+        jae ip_reg_bad_window;
+
+        lea r10, [rip + _ip_client_endpt_table];
+        mov [r10 + rdi*8 + 0], rsi;
+
+        xor rax, rax;                        // IP_OK
+        ret;
+
+      ip_reg_bad_window:
+        mov rax, 0xFFFFFFFFFFFFFFFD;         // IP_ERR_BAD_WINDOW
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // input_pump_stamp_and_route(payload_ptr) -> u64
+  //
+  // Register plan: 2 callee-save pushes (r12 = payload_ptr, r13 =
+  // focus window id, survives the table lookup); no nested call, so
+  // alignment is a non-issue.
+  // ==========================================================================
+
+  pub let input_pump_stamp_and_route : (u64) -> u64 !{mem} @{} =
+    fn (payload_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R102.M3-002 (#9): InputPump::input_pump_stamp_and_route. Pure, syscall-free routing decision (see file header 'Entry points' note -- split out specifically so tests/probe_input_pump.pdx can exercise it without a live broker). Loads FocusCache into r13; stages the 0xFFFFFFFFFFFFFFFF sentinel into r10 and compares via `cmp r13,r10` (register,register -- never an imm64 compare) to detect IP_FOCUS_NONE, branching to the no-focus error path before touching the payload at all. Otherwise unconditionally stamps r13 into payload_ptr+0 (IER_OFF_WINDOW_ID) -- routing authority belongs to the compositor's FocusCache, never the raw channel (file header note 3). Defensively bounds r13 against 256 (IP_MAX_WINDOWS) before indexing the client table, in case focus_cache_set was ever called with an out-of-range id. Loads table[window_id]; compares against the same staged 0xFFFFFFFFFFFFFFFF sentinel (IP_UNREGISTERED) to detect an unregistered window, branching to the no-client error path. On a hit, rax carries the resolved client endpoint (< 256, uniformly discriminable from any of this function's error sentinels by a single `cmp rax,256;jae`, mirroring sys_svc_lookup_body's own slot-vs-errno convention). 2 callee-save pushes (r12=payload_ptr, r13=focus window id); no nested call. Labels prefixed ip_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                        // r12 = payload_ptr
+
+        lea r10, [rip + _ip_focus_window_id];
+        mov r13, [r10 + 0];                  // r13 = focused window id
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;         // IP_FOCUS_NONE (staged, never an imm64 cmp)
+        cmp r13, r10;
+        je  ip_route_no_focus;
+
+        mov [r12 + 0], r13;                  // stamp window_id (IER_OFF_WINDOW_ID)
+
+        cmp r13, 256;                        // IP_MAX_WINDOWS (literal) -- defensive bound
+        jae ip_route_bad_window;
+
+        lea r11, [rip + _ip_client_endpt_table];
+        mov rax, [r11 + r13*8 + 0];          // rax = client endpoint (or sentinel)
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;         // IP_UNREGISTERED (staged)
+        cmp rax, r10;
+        je  ip_route_no_client;
+
+        jmp ip_route_out;                    // rax = resolved client endpoint
+
+      ip_route_no_focus:
+        mov rax, 0xFFFFFFFFFFFFFFFB;         // IP_ERR_NO_FOCUS
+        jmp ip_route_out;
+
+      ip_route_bad_window:
+        mov rax, 0xFFFFFFFFFFFFFFFD;         // IP_ERR_BAD_WINDOW
+        jmp ip_route_out;
+
+      ip_route_no_client:
+        mov rax, 0xFFFFFFFFFFFFFFFC;         // IP_ERR_NO_CLIENT
+
+      ip_route_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // input_pump_deliver_event(payload_ptr) -> u64
+  //
+  // Register plan: 2 callee-save pushes (r12 = payload_ptr, r13 =
+  // routed client endpoint / error), mirroring render_loop_tick's
+  // shipped push discipline across a nested call (see paideia-as
+  // compliance section above).
+  // ==========================================================================
+
+  pub let input_pump_deliver_event : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (payload_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "Wave III R102.M3-002 (#9): InputPump::input_pump_deliver_event. Thin syscall wrapper around input_pump_stamp_and_route (rdi=payload_ptr already set at entry; r12 stashes a copy for later use as sys_ipc_send's payload_va arg, which does not disturb rdi before the call). r13 = the routed result. `cmp r13,256;jae` drops the event (returns the routing error verbatim) exactly when stamp_and_route did not resolve a real endpoint -- forwarding to nobody is a documented no-op (file header 'Entry points' note), not a fault. On a resolved endpoint, packs the 8-byte header as payload_len(64, IER_SIZE_BYTES literal)<<32 | op(0x40, IP_OP_DELIVER_INPUT_EVENT literal) into _ip_hdr_scratch (ver=0 and flags=0 both fold into the zero upper bits of the low dword alongside op, since ver occupies bits 8..15 and flags bits 16..31 -- both zero at this closer, so no explicit OR is needed for them), then issues sys_ipc_send: rdi=client endpoint (r13), rsi=&_ip_hdr_scratch, rdx=payload_ptr (r12), r10=64 (payload_len -- 4th syscall arg travels in r10 per the SysV *syscall* convention, not rcx, matching src/user/mv.pdx's own precedent in the paideia-os monorepo), rax=42 (SC+ ID sys_ipc_send), syscall. Returns sys_ipc_send's result verbatim. 2 callee-save pushes (r12, r13) mirror render_loop_tick's shipped discipline (this repo, src/render_loop.pdx) rather than claiming precise 16-byte alignment math -- no SSE/aligned-load instruction exists anywhere in this tree. Labels prefixed ip_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;                        // r12 = payload_ptr (rdi untouched, still payload_ptr)
+
+        call input_pump_stamp_and_route;
+        mov r13, rax;                        // r13 = resolved client endpoint, or an error sentinel
+
+        cmp r13, 256;                        // any error sentinel is huge-unsigned
+        jae ip_deliver_drop;
+
+        mov rax, 64;                         // IER_SIZE_BYTES (literal) -- payload_len
+        shl rax, 32;
+        mov r10, 0x40;                       // IP_OP_DELIVER_INPUT_EVENT (literal); ver=0, flags=0
+        or  rax, r10;
+        lea r11, [rip + _ip_hdr_scratch];
+        mov [r11 + 0], rax;
+
+        mov rdi, r13;                        // id = client endpoint
+        mov rsi, r11;                        // hdr_va = &_ip_hdr_scratch
+        mov rdx, r12;                        // payload_va
+        mov r10, 64;                         // payload_len; 4th syscall arg in r10, not rcx
+        mov rax, 42;                         // SC+ ID 42 = sys_ipc_send
+        syscall;
+
+        jmp ip_deliver_out;
+
+      ip_deliver_drop:
+        mov rax, r13;                        // pass through the routing error verbatim
+
+      ip_deliver_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+}

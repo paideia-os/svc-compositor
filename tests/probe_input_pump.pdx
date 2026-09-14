@@ -1,0 +1,138 @@
+// tests/probe_input_pump.pdx -- svc-compositor v1.3.0 (Wave III:
+// R102.M3-002 / #9)
+// ProbeInputPump: real-body witness for InputPump's routing logic.
+//
+// ================================================================
+// Honest-witness scope
+// ================================================================
+//
+// Exercises ONLY the syscall-free routing decision
+// (input_pump_stamp_and_route) plus the two pure accessors
+// (input_pump_register_client, focus_cache_set/get). It deliberately
+// does NOT call input_pump_init or input_pump_deliver_event: both
+// perform a real `syscall` (sys_svc_lookup / sys_ipc_send) whose
+// success depends on external state -- a live svc.input broker
+// registration and a live peer IPC endpoint -- that no probe context
+// controls. Calling either here would either fabricate a false green
+// (swallowing a legitimate -ENOENT / EAGAIN as if it were success) or
+// make the probe's pass/fail depend on boot ordering outside this
+// repo, neither of which this org's "honest witness" contract allows
+// (see tests/README.md's own "Why honest witness and not rig" note,
+// and boot_r102_input_route.pdx's identical posture for the same
+// dependency). What IS exercised here is the actual stamping +
+// lookup arithmetic that will run on every real event once M3-001's
+// live svc.input broker exists -- an exact round-trip check, not
+// merely "the call did not crash" (same bar probe_commit.pdx sets).
+//
+// paideia-as encoder notes: identical syscall shape (final fingerprint
+// only) to tests/probe_commit.pdx; labels prefixed `probe_ip_`.
+
+module ProbeInputPump = structure {
+
+  pub let probe_ip_fp     : [u8; 30] = "svc-compositor input-pump ok\n\0"
+  pub let probe_ip_fp_len : u64      = 29
+
+  // Synthetic 64-byte InputEventRecord scratch. window_id (+0) is
+  // seeded with an obviously-wrong marker (0xDEAD) so the assertion
+  // below proves the stamp actually happened, not that the field
+  // already held the right value by luck.
+  pub let mut _probe_ip_event : [u64; 8] = uninit @align(64)
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.R102.M3-002 (#9): ProbeInputPump::run. (1) input_pump_register_client(window_id=7, client_endpoint=42) -> assert rax==0. (2) focus_cache_set(7) -> assert rax==0; focus_cache_get() -> assert rax==7. (3) Build a synthetic InputEventRecord in _probe_ip_event with window_id=0xDEAD (wrong-on-purpose marker), event_type=1, keycode=30, modifiers=0, pointer_x=0, pointer_y=0, pointer_button=0, ts_ns=123456789. Call input_pump_stamp_and_route -> assert rax==42 (the registered client endpoint), then re-read _probe_ip_event+0 and assert it now reads 7 -- proves the stamp overwrote the wrong-on-purpose marker rather than the lookup succeeding independently of it. (4) focus_cache_set(IP_FOCUS_NONE=0xFFFFFFFFFFFFFFFF) -> input_pump_stamp_and_route -> assert rax==IP_ERR_NO_FOCUS (0xFFFFFFFFFFFFFFFB). (5) focus_cache_set(99, never registered) -> input_pump_stamp_and_route -> assert rax==IP_ERR_NO_CLIENT (0xFFFFFFFFFFFFFFFC). (6) input_pump_register_client(window_id=999, ...) -> assert rax==IP_ERR_BAD_WINDOW (0xFFFFFFFFFFFFFFFD). Only after every assertion passes does it emit the fingerprint via sys_write. No test rN,rN; no and rN,imm64; no byte-register mov; every 64-bit sentinel comparison stages the literal through a register first. Labels prefixed probe_ip_.",
+      block: {
+        // ---- (1) register_client(7, 42) ----
+        mov rdi, 7;
+        mov rsi, 42;
+        call input_pump_register_client;
+        cmp rax, 0;
+        jne probe_ip_fail;
+
+        // ---- (2) focus_cache_set(7) / focus_cache_get() ----
+        mov rdi, 7;
+        call focus_cache_set;
+        cmp rax, 0;
+        jne probe_ip_fail;
+
+        call focus_cache_get;
+        cmp rax, 7;
+        jne probe_ip_fail;
+
+        // ---- (3) build synthetic event + route ----
+        lea r10, [rip + _probe_ip_event];
+        mov rax, 0xDEAD;
+        mov [r10 + 0], rax;                  // window_id (wrong-on-purpose marker)
+        mov rax, 1;
+        mov [r10 + 8], rax;                  // event_type = KEY_DOWN
+        mov rax, 30;
+        mov [r10 + 16], rax;                 // keycode
+        xor rax, rax;
+        mov [r10 + 24], rax;                 // modifiers
+        mov [r10 + 32], rax;                 // pointer_x
+        mov [r10 + 40], rax;                 // pointer_y
+        mov [r10 + 48], rax;                 // pointer_button
+        mov rax, 123456789;
+        mov [r10 + 56], rax;                 // ts_ns (lo)
+
+        mov rdi, r10;
+        call input_pump_stamp_and_route;
+        cmp rax, 42;
+        jne probe_ip_fail;
+
+        lea r10, [rip + _probe_ip_event];
+        mov rax, [r10 + 0];
+        cmp rax, 7;
+        jne probe_ip_fail;
+
+        // ---- (4) no-focus path ----
+        mov rdi, 0xFFFFFFFFFFFFFFFF;         // IP_FOCUS_NONE
+        call focus_cache_set;
+
+        lea r10, [rip + _probe_ip_event];
+        mov rdi, r10;
+        call input_pump_stamp_and_route;
+        mov r11, 0xFFFFFFFFFFFFFFFB;         // IP_ERR_NO_FOCUS (staged)
+        cmp rax, r11;
+        jne probe_ip_fail;
+
+        // ---- (5) no-client path ----
+        mov rdi, 99;
+        call focus_cache_set;
+
+        lea r10, [rip + _probe_ip_event];
+        mov rdi, r10;
+        call input_pump_stamp_and_route;
+        mov r11, 0xFFFFFFFFFFFFFFFC;         // IP_ERR_NO_CLIENT (staged)
+        cmp rax, r11;
+        jne probe_ip_fail;
+
+        // ---- (6) bad-window path ----
+        mov rdi, 999;
+        mov rsi, 1;
+        call input_pump_register_client;
+        mov r11, 0xFFFFFFFFFFFFFFFD;         // IP_ERR_BAD_WINDOW (staged)
+        cmp rax, r11;
+        jne probe_ip_fail;
+
+        // ---- fingerprint ----
+        mov rdi, 1;
+        lea rsi, [rip + probe_ip_fp];
+        mov rdx, 29;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_ip_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_ip_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

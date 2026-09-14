@@ -3,12 +3,11 @@
 **Wave:** R102 (userland graphical stack, CPU-side compositor)
 **Current milestone:** M5 (signed 1.0.0 release) — **landed** + Wave Y drain of
 five M1/M2/M3 substrate primitives (#2, #3, #5, #10, #11) + Wave PP
-cohort landing five active M1/M2/M3 closers (#1, #4, #6, #7, #8).
-**Version:** 1.2.0 (Wave PP — repo-scaffold cap-kind enumeration
-(#1), the loader-LFB scanout body (#4), the 60 Hz render loop over
-HPET (#6), the COMMIT_SURFACE handler (#7), and the KIND_FB_SCANOUT
-cap query (#8) all land with real, callable function bodies + real-
-body probe witnesses, on top of Wave Y's v1.1.0 substrate tables).
+cohort landing five active M1/M2/M3 closers (#1, #4, #6, #7, #8) + Wave
+III's M3-002 input pump (#9).
+**Version:** 1.3.0 (Wave III — the R101 focus-routed input pump
+(#9) lands with a real, callable function body + a real-body probe
+witness, on top of Wave PP's v1.2.0 closers).
 
 See `design/graphics/r102-user-plan.md` §4.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -95,7 +94,24 @@ full five-milestone breakdown this checklist mirrors.
       Real-body probe witness at `tests/probe_fb_scanout_cap.pdx`
       publishes `svc-compositor kind-fb-scanout ok\n` (34 bytes).
       Closes #8.
-- [ ] **M3-002** — input pump over R101 focus-routed channel — still open.
+- [x] **M3-002** — input pump over R101 focus-routed channel landed at
+      v1.3.0 (Wave III / #9) as `src/input_pump.pdx` (`Module
+      InputPump`): resolves `svc.input` via `sys_svc_lookup` (sysno
+      43), stamps each polled InputEventRecord@0.1's `window_id` from
+      a local FocusCache mirror (real libpdx-event FocusCache not yet
+      linkable — file header note 1), and forwards to that window's
+      registered client endpoint via `sys_ipc_send` (sysno 42). The
+      per-window client-endpoint table is this closer's own
+      self-contained mirror, mirroring commit.pdx's (#7) precedent
+      of not depending on window_table.pdx's still-unallocated row-
+      store — a future closer that lands the real accept-loop
+      row-store should reconcile the two. `input_pump_stamp_and_route`
+      is split out from the syscall wrapper specifically so it can be
+      probed without a live broker. Real-body probe witness at
+      `tests/probe_input_pump.pdx` round-trips a full stamp+lookup
+      cycle (success, no-focus, no-client, and bad-window paths) and
+      asserts each outcome before publishing `svc-compositor
+      input-pump ok\n` (29 bytes). Closes #9.
 - [x] **M3-003** — query surface record types + reply-header layout
       landed at v1.1.0 as `src/query_surface.pdx`
       (WindowRecord@0.1, DisplayGeometryRecord@0.1,

@@ -1,5 +1,28 @@
 # svc-compositor — CHANGELOG
 
+## 1.3.0 — 2026-09-13 (Wave III: R102.M3-002 input pump)
+
+### Added
+
+- **`src/input_pump.pdx`** — R102.M3-002 (#9). `InputPump` module.
+  Resolves the `svc.input` endpoint via `sys_svc_lookup` (sysno 43),
+  stamps each InputEventRecord@0.1's `window_id` from a local
+  FocusCache mirror (`focus_cache_get`/`focus_cache_set` — the real
+  libpdx-event FocusCache is not yet linkable from this satellite
+  repo), and forwards the 64-byte record to that window's registered
+  client endpoint via `sys_ipc_send` (sysno 42). The per-window
+  client-endpoint table (`input_pump_register_client`) is this
+  closer's own self-contained mirror, following `commit.pdx`'s (#7)
+  precedent of not depending on `window_table.pdx`'s still-unallocated
+  row-store. The routing decision (`input_pump_stamp_and_route`) is
+  split out from the syscall wrapper (`input_pump_deliver_event`) so
+  it is testable without a live broker or peer endpoint. Real-body
+  probe witness at `tests/probe_input_pump.pdx` round-trips the
+  success, no-focus, no-client, and bad-window paths before publishing
+  `svc-compositor input-pump ok\n` (29 bytes). `caps.decl`'s
+  `KIND_INPUT_EVENT` comment updated from "(#9, not in this wave)" to
+  reflect the landing. Closes #9.
+
 ## 1.2.0 — 2026-09-13 (Wave PP: five M1/M2/M3 closers with real bodies)
 
 **Minor bump landing five closers across M1/M2/M3 with real, callable

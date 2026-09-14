@@ -56,8 +56,8 @@ cap.uses             = KIND_IPC_ENDPOINT
 #   once libpdx-gfx.M3-001 mints real KIND_SURFACE caps.
 cap.uses             = KIND_SURFACE
 # KIND_INPUT_EVENT: materialized HID event object the M3-002 input
-#   pump (#9, not in this wave) forwards to the focused window's
-#   subscribed client.
+#   pump (#9, landed Wave III / v1.3.0, src/input_pump.pdx) forwards
+#   to the focused window's subscribed client.
 cap.uses             = KIND_INPUT_EVENT
 
 # ------------------------------------------------------------------
