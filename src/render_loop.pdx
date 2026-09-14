@@ -1,17 +1,19 @@
-// src/render_loop.pdx -- svc-compositor v1.2.0 (Wave PP: R102.M2-003 / #6)
-// RenderLoop module: 60 Hz render loop over HPET
-// (sys_clock_read_ns, sysno 66).
+// src/render_loop.pdx -- svc-compositor v1.5.0 (Wave eps: eps-01 / #116)
+// RenderLoop module: 60 Hz render loop, frame pacing via
+// sys_sched_wait_ns (sysno 116); timestamps via sys_clock_read_ns
+// (sysno 66).
 //
 // ================================================================
 // Scope (per issue #6 / design/graphics/r102-user-plan.md §4.4
-// R102.M2-003, §5.5)
+// R102.M2-003, §5.5; frame-pacing retired from busy-wait to
+// sys_sched_wait_ns under Wave eps, eps-01)
 // ================================================================
 //
-// Each tick: read the monotonic clock (sys_clock_read_ns, sysno 66,
-// HPET-backed per design/user/syscall-table.md row 66), busy-wait
-// until at least 16_666_666 ns (60 Hz best-effort period) have
-// elapsed since the previous tick, drain every dirty surface's
-// pending damage into the scanout buffer via Scanout.scanout_blit_rect
+// Each tick: sleep for the 60 Hz best-effort frame period via
+// sys_sched_wait_ns(16_666_666) (sysno 116, design/user/syscall-table.md
+// row 116) rather than busy-waiting against the monotonic clock, drain
+// every dirty surface's pending damage into the scanout buffer via
+// Scanout.scanout_blit_rect
 // (src/scanout.pdx, #4), and emit a PresentRecord@0.1-shaped summary.
 //
 // "Drain placement queue" (per the design doc's fuller M2-003 scope)
@@ -58,9 +60,13 @@
 //       _rl_tick_id. Always returns 0.
 //
 //   * render_loop_wait_frame() -> u64
-//       Busy-waits (repeated sys_clock_read_ns) until at least
-//       16_666_666 ns have elapsed since _rl_last_tick_ns, publishes
-//       the new timestamp, and returns the elapsed delta in ns.
+//       Sleeps for the 60 Hz frame period via a single
+//       sys_sched_wait_ns(16_666_666) call (sysno 116) and returns the
+//       actual elapsed ns (rax) as frame_duration_ns. _rl_last_tick_ns
+//       is no longer read or updated here (Wave eps, eps-01): it
+//       remains seeded once by render_loop_init but has no other
+//       reader now that pacing is scheduler-driven rather than a
+//       clock-delta busy-wait.
 //
 //   * compositor_render_frame() -> u64
 //       Walks Commit's 256-slot damage table (src/commit.pdx, #7);
@@ -131,7 +137,7 @@ module RenderLoop = structure {
   // State
   // ==========================================================================
 
-  pub let mut _rl_last_tick_ns  : u64        = uninit @align(8)
+  pub let mut _rl_last_tick_ns  : u64        = uninit @align(8)   // seeded by render_loop_init only; unread since Wave eps eps-01 retired the wait_frame busy-wait
   pub let mut _rl_tick_id       : u64        = uninit @align(8)
   pub let mut _rl_last_present  : [u64; 8]   = uninit @align(64)   // PresentRecord@0.1, 64 B
 
@@ -162,34 +168,21 @@ module RenderLoop = structure {
   // ==========================================================================
   // render_loop_wait_frame() -> u64
   //
-  // Busy-wait loop: re-reads the clock every iteration and re-reads
-  // _rl_last_tick_ns from memory every iteration (rather than keeping
-  // either live across the repeated `syscall`), so no register needs
-  // to survive the syscall at all. Returns the elapsed delta in ns.
+  // Wave eps (eps-01): retired the busy-wait loop in favor of a single
+  // sys_sched_wait_ns(16_666_666) call (sysno 116) -- one blocking
+  // syscall per tick instead of a repeated sys_clock_read_ns poll.
+  // Returns the actual elapsed ns (rax) as frame_duration_ns.
   // ==========================================================================
 
   pub let render_loop_wait_frame : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "R102.M2-003 (#6): RenderLoop::render_loop_wait_frame. Loop body: rax=66; syscall -> rax=now_ns; stash in r10 (caller-save, safe -- no further syscall/call before use); reload _rl_last_tick_ns into rax via rip-relative load; r9 = now_ns - last (reg,reg sub); compare against the literal 16666666 (RL_FRAME_PERIOD_NS, inlined per encoder discipline) via r8; `jb` back to the top while under-period. On exit, publish now_ns (r10) as the new _rl_last_tick_ns and return the delta (r9) in rax. No register is asked to survive the syscall except via memory (last_tick_ns) or a callee-independent single-use caller-save reg (r10, r9, r8) reloaded fresh every iteration -- conservative w.r.t. what a raw `syscall` instruction actually clobbers. Labels prefixed rl_.",
+      justification: "Wave eps (eps-01), retiring R102.M2-003's (#6) busy-wait: RenderLoop::render_loop_wait_frame. Straight-line, single syscall: rdi=16666666 (RL_FRAME_PERIOD_NS, inlined per encoder discipline) -- the ns argument to sys_sched_wait_ns; rax=116 (SC+ ID 116 = sys_sched_wait_ns); syscall -> rax = actual elapsed ns slept, returned directly as frame_duration_ns with no further register movement needed. _rl_last_tick_ns is no longer read or written here: pacing is now scheduler-driven (one blocking wait per tick) rather than a clock-delta poll loop, so there is nothing left to re-derive from memory and no register needs to survive the syscall at all. No push, no labels (no loop remains).",
       block: {
-      rl_wait_top:
-        mov rax, 66;
-        syscall;
-        mov r10, rax;                        // r10 = now_ns
+        mov rdi, 16666666;                   // RL_FRAME_PERIOD_NS (literal, ns arg)
+        mov rax, 116;                         // SC+ ID 116 = sys_sched_wait_ns
+        syscall;                              // rax = frame_duration_ns (actual ns slept)
 
-        lea r11, [rip + _rl_last_tick_ns];
-        mov rax, [r11 + 0];                  // rax = last_tick_ns
-        mov r9, r10;
-        sub r9, rax;                         // r9 = delta = now - last
-
-        mov r8, 16666666;                    // RL_FRAME_PERIOD_NS (literal)
-        cmp r9, r8;
-        jb  rl_wait_top;
-
-        mov [r11 + 0], r10;                  // publish new last_tick_ns
-
-        mov rax, r9;                         // return delta
         ret
       }
     }
