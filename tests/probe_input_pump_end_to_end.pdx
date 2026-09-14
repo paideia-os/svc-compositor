@@ -1,0 +1,121 @@
+// tests/probe_input_pump_end_to_end.pdx -- svc-compositor v1.4.0
+// (Wave OOO: SVC-CO-05)
+// ProbeInputPumpEndToEnd: real-body witness for the FULL delivery
+// path InputPump::input_pump_deliver_event drives, one level past
+// tests/probe_input_pump.pdx (#9). That probe deliberately stops at
+// input_pump_stamp_and_route (the pure, syscall-free routing
+// decision) and never calls input_pump_deliver_event, because
+// deliver_event's own sys_ipc_send outcome depends on a live peer IPC
+// endpoint no probe context controls -- asserting on THAT return
+// value would violate this org's honest-witness contract (see
+// probe_input_pump.pdx's own header and tests/README.md).
+//
+// This probe stays inside that same contract while still exercising
+// deliver_event for real: it asserts only what input_pump_deliver_event's
+// own control flow guarantees deterministically, never the raw
+// sys_ipc_send completion code. Per src/input_pump.pdx's source (the
+// `cmp r13,256;jae ip_deliver_drop` gate in input_pump_deliver_event),
+// once input_pump_stamp_and_route resolves a real client endpoint
+// (< 256), the function is UNCONDITIONALLY committed to issuing
+// sys_ipc_send with that endpoint as rdi -- no live peer is required
+// for the syscall to be *issued* (only for it to *succeed*, which
+// this probe does not depend on). So: registering client_endpoint=99
+// for window_id=42 and confirming the routed endpoint == 99 is
+// itself the proof that \"sys_ipc_send fires with target=99\" --
+// the two are the same fact, by this function's own documented
+// control flow. window_id==42 stamped is checked directly by
+// re-reading the payload after the call.
+//
+// paideia-as encoder notes: identical fingerprint syscall shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_ipe_`.
+
+module ProbeInputPumpEndToEnd = structure {
+
+  pub let probe_ipe_fp     : [u8; 34] = "svc-compositor input-pump-e2e ok\n\0"
+  pub let probe_ipe_fp_len : u64      = 33
+
+  // Synthetic 64-byte InputEventRecord scratch (KEYDOWN). window_id
+  // (+0) is seeded with an obviously-wrong marker (0xDEAD) both
+  // before the setup call AND again before the real delivery call,
+  // so each assertion proves that specific call performed the stamp
+  // rather than the field already holding the right value by luck.
+  pub let mut _probe_ipe_event : [u64; 8] = uninit @align(64)
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.WaveOOO (SVC-CO-05): ProbeInputPumpEndToEnd::run. (1) input_pump_register_client(window_id=42, client_endpoint=99) -> assert rax==0. (2) focus_cache_set(42) -> assert rax==0. (3) Build a synthetic InputEventRecord@0.1 in _probe_ipe_event with window_id=0xDEAD (wrong-on-purpose marker), event_type=1 (KEY_DOWN, matching probe_input_pump.pdx's own convention), keycode=44, modifiers=0, pointer_x=0, pointer_y=0, pointer_button=0, ts_ns=987654321. (4) Calls input_pump_stamp_and_route directly first (external symbol, src/input_pump.pdx) as an independent, syscall-free confirmation that this exact setup resolves to client_endpoint=99 -- asserts rax==99, then re-reads _probe_ipe_event+0 and asserts it now reads 42, proving the stamp fired rather than the routing succeeding independently of it. (5) Re-seeds window_id back to the 0xDEAD marker (so the NEXT call's stamp is independently provable) and calls input_pump_deliver_event(payload_ptr) for real -- this is the first probe in this tree to do so. Per src/input_pump.pdx's own source, deliver_event re-runs stamp_and_route internally (deterministically re-resolving 99, since setup is unchanged) and its `cmp r13,256;jae ip_deliver_drop` gate means a resolved endpoint <256 UNCONDITIONALLY falls through to issuing sys_ipc_send(rdi=99,...) next -- no live peer endpoint is required for the syscall to be *issued*, only for it to *succeed*, which this probe never asserts on (honest-witness discipline, matching probe_input_pump.pdx's own stated reason for stopping short of this call). Re-reads _probe_ipe_event+0 and asserts it reads 42 again (deliver_event's internal stamp fired a second time, independent of step 4's). Only after every deterministic assertion passes does it emit the fingerprint via sys_write; deliver_event's own raw return value (sys_ipc_send's completion code) is deliberately never inspected. No test rN,rN; no and rN,imm64; no byte-register mov. Labels prefixed probe_ipe_.",
+      block: {
+        // ---- (1) register_client(window_id=42, client_endpoint=99) ----
+        mov rdi, 42;
+        mov rsi, 99;
+        call input_pump_register_client;
+        cmp rax, 0;
+        jne probe_ipe_fail;
+
+        // ---- (2) focus_cache_set(42) ----
+        mov rdi, 42;
+        call focus_cache_set;
+        cmp rax, 0;
+        jne probe_ipe_fail;
+
+        // ---- (3) build synthetic KEYDOWN event ----
+        lea r10, [rip + _probe_ipe_event];
+        mov rax, 0xDEAD;
+        mov [r10 + 0], rax;                  // window_id (wrong-on-purpose marker)
+        mov rax, 1;
+        mov [r10 + 8], rax;                  // event_type = KEY_DOWN
+        mov rax, 44;
+        mov [r10 + 16], rax;                 // keycode
+        xor rax, rax;
+        mov [r10 + 24], rax;                 // modifiers
+        mov [r10 + 32], rax;                 // pointer_x
+        mov [r10 + 40], rax;                 // pointer_y
+        mov [r10 + 48], rax;                 // pointer_button
+        mov rax, 987654321;
+        mov [r10 + 56], rax;                 // ts_ns (lo)
+
+        // ---- (4) syscall-free routing confirmation ----
+        mov rdi, r10;
+        call input_pump_stamp_and_route;
+        cmp rax, 99;
+        jne probe_ipe_fail;
+
+        lea r10, [rip + _probe_ipe_event];
+        mov rax, [r10 + 0];
+        cmp rax, 42;
+        jne probe_ipe_fail;
+
+        // ---- (5) real delivery: sys_ipc_send fires with target=99 ----
+        lea r10, [rip + _probe_ipe_event];
+        mov rax, 0xDEAD;
+        mov [r10 + 0], rax;                  // reset marker before the real call
+
+        mov rdi, r10;
+        call input_pump_deliver_event;       // fires sys_ipc_send(rdi=99, ...) -- return value not inspected
+
+        lea r10, [rip + _probe_ipe_event];
+        mov rax, [r10 + 0];
+        cmp rax, 42;
+        jne probe_ipe_fail;
+
+        // ---- fingerprint ----
+        mov rdi, 1;
+        lea rsi, [rip + probe_ipe_fp];
+        mov rdx, 33;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_ipe_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_ipe_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

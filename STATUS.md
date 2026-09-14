@@ -4,10 +4,15 @@
 **Current milestone:** M5 (signed 1.0.0 release) — **landed** + Wave Y drain of
 five M1/M2/M3 substrate primitives (#2, #3, #5, #10, #11) + Wave PP
 cohort landing five active M1/M2/M3 closers (#1, #4, #6, #7, #8) + Wave
-III's M3-002 input pump (#9).
-**Version:** 1.3.0 (Wave III — the R101 focus-routed input pump
-(#9) lands with a real, callable function body + a real-body probe
-witness, on top of Wave PP's v1.2.0 closers).
+III's M3-002 input pump (#9) + Wave OOO's 5 integration probes
+(SVC-CO-01..05).
+**Version:** 1.4.0 (Wave OOO — 5 integration probes deepen coverage of
+already-landed M2/M3 closers: a real pixel-roundtrip blit, a
+real-cadence render-loop timing assertion, a second commit-message
+decode at a non-adjacent damage-table slot, a stricter WEAK-stub-exact
+fb-scanout-query check, and the tree's first real
+`input_pump_deliver_event` exercise. No `src/` changes — test-only
+landing on top of Wave III's v1.3.0).
 
 See `design/graphics/r102-user-plan.md` §4.4 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the

@@ -1,0 +1,134 @@
+// tests/probe_scanout_roundtrip.pdx -- svc-compositor v1.4.0 (Wave OOO:
+// SVC-CO-01)
+// ProbeScanoutRoundtrip: real-body pixel-roundtrip witness for
+// Scanout::scanout_blit_rect. Unlike tests/probe_scanout.pdx (#4),
+// which stays off Scanout's WEAK-stub sentinel base pointer
+// (0xFFFFF00000000000, deliberately unmapped -- see src/scanout.pdx's
+// file header) by only ever calling scanout_blit_rect with w=0/h=0,
+// this probe substitutes its OWN writable 64x64 buffer for the
+// module-level `_lfb_ptr` / `_lfb_pitch` / `_lfb_width` / `_lfb_height`
+// state (the same external symbols tests/probe_scanout.pdx already
+// reads) instead of calling scanout_init at all. That lets it issue a
+// real, full-size, nonzero-w/h blit and memcmp the destination back
+// against the source pattern for an exact byte-identical roundtrip --
+// something no existing probe in this tree exercises (probe_scanout.pdx's
+// own header explains why a nonzero blit through the real WEAK-stub
+// sentinel would fault; this probe sidesteps that by never pointing
+// _lfb_ptr at the sentinel in the first place).
+//
+// paideia-as encoder notes: identical fingerprint syscall shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_srt_`.
+
+module ProbeScanoutRoundtrip = structure {
+
+  pub let probe_srt_fp     : [u8; 37] = "svc-compositor scanout-roundtrip ok\n\0"
+  pub let probe_srt_fp_len : u64      = 36
+
+  // 64x64 @ 4 bytes/pixel (BGRA8888), tightly packed (pitch == w*4,
+  // no padding) -- 16384 bytes each, used as the blit's source AND
+  // as a fake "LFB" the test itself owns (never the real unmapped
+  // WEAK-stub sentinel).
+  pub let mut _probe_srt_src : [u8; 16384] = uninit @align(8)
+  pub let mut _probe_srt_dst : [u8; 16384] = uninit @align(8)
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.WaveOOO (SVC-CO-01): ProbeScanoutRoundtrip::run. Fills _probe_srt_src's 4096 dwords with a known incrementing pattern (dword i <- i, via a pointer-increment loop: `mov [r10+0],eax; add r10,4; add eax,1; add rcx,4; cmp rcx,16384; jb loop` -- no SIB-scaled indexed addressing, matching this file's own conservative-encoding discipline) and fills _probe_srt_dst's 4096 dwords with the constant 0xCAFEBABE (a value guaranteed to differ from every src dword except by coincidence at i=0xCAFEBABE, unreachable since i<4096) so a no-op blit could never accidentally read back as a match. Directly latches Scanout's module state (external symbols _lfb_ptr/_lfb_pitch/_lfb_width/_lfb_height, src/scanout.pdx) to point at _probe_srt_dst/256/64/64 -- bypassing scanout_init's WEAK-stub sentinel entirely, so the destination is a real, writable, test-owned buffer rather than the unmapped 0xFFFFF00000000000 sentinel scanout_init would latch (see probe_scanout.pdx's header for why a nonzero blit through that sentinel would fault). Calls scanout_blit_rect(xy=0, wh=64|(64<<32), src_ptr=&_probe_srt_src, src_pitch=256) -- a real, full-size, nonzero-w/h blit exercising the row-copy loop (external symbol, src/scanout.pdx); asserts rax==0 (SCANOUT_OK). Then memcmp's all 4096 dwords of _probe_srt_dst against _probe_srt_src (two pointer-increment cursors, each dword staged through a register before `cmp reg,reg` -- no `cmp reg,[mem]`); any mismatch short-circuits to probe_srt_fail. Only after every dword matches does it emit the fingerprint via sys_write and assert a non-negative write count. No test rN,rN; no and rN,imm64; no byte-register mov; no SIB-scaled indexed addressing. Labels prefixed probe_srt_.",
+      block: {
+        // ---- Fill _probe_srt_src: dword i <- i, i in [0, 4096). ----
+        lea r10, [rip + _probe_srt_src];
+        xor rax, rax;                        // pattern value / dword index
+        xor rcx, rcx;                        // byte offset
+
+      probe_srt_fill_src_loop:
+        cmp rcx, 16384;
+        jae probe_srt_fill_dst_init;
+        mov [r10 + 0], eax;
+        add r10, 4;
+        add eax, 1;
+        add rcx, 4;
+        jmp probe_srt_fill_src_loop;
+
+        // ---- Fill _probe_srt_dst: every dword <- 0xCAFEBABE. ----
+      probe_srt_fill_dst_init:
+        lea r10, [rip + _probe_srt_dst];
+        mov eax, 0xCAFEBABE;
+        xor rcx, rcx;
+
+      probe_srt_fill_dst_loop:
+        cmp rcx, 16384;
+        jae probe_srt_setup;
+        mov [r10 + 0], eax;
+        add r10, 4;
+        add rcx, 4;
+        jmp probe_srt_fill_dst_loop;
+
+        // ---- Point Scanout's module state at our own buffers. ----
+      probe_srt_setup:
+        lea r10, [rip + _probe_srt_dst];
+        lea r11, [rip + _lfb_ptr];
+        mov [r11 + 0], r10;                  // _lfb_ptr <- &_probe_srt_dst
+
+        lea r11, [rip + _lfb_pitch];
+        mov rax, 256;                        // 64 px * 4 B/px, tightly packed
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + _lfb_width];
+        mov rax, 64;
+        mov [r11 + 0], rax;
+
+        lea r11, [rip + _lfb_height];
+        mov rax, 64;
+        mov [r11 + 0], rax;
+
+        // ---- Real full-size blit: xy=0, wh=64|(64<<32). ----
+        xor rdi, rdi;                        // xy = 0 (x=0, y=0)
+        mov rax, 64;
+        shl rax, 32;
+        mov r8, 64;
+        or  rax, r8;                         // wh = 64 | (64 << 32)
+        mov rsi, rax;
+        lea rdx, [rip + _probe_srt_src];     // src_ptr
+        mov rcx, 256;                        // src_pitch
+        call scanout_blit_rect;
+        cmp rax, 0;
+        jne probe_srt_fail;
+
+        // ---- memcmp _probe_srt_dst against _probe_srt_src. ----
+        lea r10, [rip + _probe_srt_src];
+        lea r11, [rip + _probe_srt_dst];
+        xor rcx, rcx;
+
+      probe_srt_cmp_loop:
+        cmp rcx, 16384;
+        jae probe_srt_ok;
+        mov eax, [r10 + 0];
+        mov edx, [r11 + 0];
+        cmp rax, rdx;
+        jne probe_srt_fail;
+        add r10, 4;
+        add r11, 4;
+        add rcx, 4;
+        jmp probe_srt_cmp_loop;
+
+      probe_srt_ok:
+        mov rdi, 1;
+        lea rsi, [rip + probe_srt_fp];
+        mov rdx, 36;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_srt_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_srt_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

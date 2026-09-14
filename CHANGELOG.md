@@ -1,5 +1,45 @@
 # svc-compositor — CHANGELOG
 
+## 1.4.0 — 2026-09-13 (Wave OOO: 5 integration probes)
+
+### Added
+
+- **`tests/probe_scanout_roundtrip.pdx`** (SVC-CO-01) — fills a 64x64
+  BGRA8888 source buffer with a known incrementing dword pattern,
+  points `Scanout`'s module state (`_lfb_ptr`/`_lfb_pitch`/
+  `_lfb_width`/`_lfb_height`) at a second, test-owned writable buffer
+  (bypassing `scanout_init`'s unmapped WEAK-stub sentinel entirely),
+  calls `scanout_blit_rect` for a real full-size nonzero-w/h blit, and
+  memcmp's the destination back against the source for an exact
+  byte-identical roundtrip.
+- **`tests/probe_render_loop_cadence.pdx`** (SVC-CO-02) — brackets a
+  real `render_loop_run(10)` (which, unlike `probe_render_loop.pdx`,
+  does not skip `render_loop_init`, so every tick's busy-wait runs for
+  a genuine ~16.6 ms frame period) with two `sys_clock_read_ns` reads
+  and asserts the elapsed wall-clock delta lands within +/-5ms of
+  `10 * 16_666_666` ns.
+- **`tests/probe_commit_message_decode.pdx`** (SVC-CO-03) — a second,
+  independent `commit_surface_handle` witness at a different
+  surface_id/rect (42, x=10 y=20 w=100 h=200) than
+  `probe_commit.pdx`'s own (5, x=10 y=20 w=30 h=40), proving the
+  damage table's `surface_id * 4` slot-index arithmetic at a
+  non-adjacent slot (168).
+- **`tests/probe_fb_scanout_query.pdx`** (SVC-CO-04) — a stricter
+  companion to `probe_fb_scanout_cap.pdx` (#8): asserts
+  `kind_fb_scanout_query(cap_id=0)` returns `FBS_RESULT_WEAK_STUB`
+  (1) exactly, plus the WEAK-stub's canned 1920x1080 @ pitch 7680
+  geometry, rather than merely tolerating either outcome.
+- **`tests/probe_input_pump_end_to_end.pdx`** (SVC-CO-05) — the first
+  probe in this tree to call `input_pump_deliver_event` for real
+  (rather than stopping at the pure `input_pump_stamp_and_route`, as
+  `probe_input_pump.pdx` does). Seeds FocusCache for window_id=42 ->
+  client_endpoint=99, feeds a KEYDOWN `InputEventRecord`, and asserts
+  the deterministic, environment-independent facts `deliver_event`'s
+  own control flow guarantees (routed endpoint==99, window_id stamped
+  to 42 both before and after the call) without ever inspecting
+  `sys_ipc_send`'s own completion code — honest-witness discipline
+  preserved even while exercising the real delivery path.
+
 ## 1.3.0 — 2026-09-13 (Wave III: R102.M3-002 input pump)
 
 ### Added

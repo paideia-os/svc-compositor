@@ -1,0 +1,76 @@
+// tests/probe_fb_scanout_query.pdx -- svc-compositor v1.4.0 (Wave
+// OOO: SVC-CO-04)
+// ProbeFbScanoutQuery: a stricter, WEAK-stub-path-specific companion
+// to tests/probe_fb_scanout_cap.pdx (#8). That probe asserts only
+// `rax <= 1` for kind_fb_scanout_query's return status, since in
+// general the caller's cap slot resolution is not something a probe
+// can predict (see its own header). In THIS probe context, however,
+// cap_id=0 is a fixed, never-populated slot -- no loader in a probe
+// build hands this process a real FB_SCANOUT cap (per
+// src/fb_scanout_cap.pdx's own header: "the ONLY possible outcome
+// today since no loader hands the compositor a real FB_SCANOUT cap
+// slot yet") -- so sys_cap_invoke deterministically resolves to 0 or
+// INVALID_HANDLE and the WEAK-stub fallback fires every time. This
+// probe asserts that specific, documented outcome exactly (status ==
+// FBS_RESULT_WEAK_STUB == 1) rather than merely allowing it, plus the
+// always-WEAK-stubbed geometry the SVC-CO-04 acceptance text names:
+// 1920x1080 @ pitch 7680.
+//
+// paideia-as encoder notes: identical fingerprint syscall shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_fsq_`.
+
+module ProbeFbScanoutQuery = structure {
+
+  pub let probe_fsq_fp     : [u8; 36] = "svc-compositor fb-scanout-query ok\n\0"
+  pub let probe_fsq_fp_len : u64      = 35
+
+  pub let mut _probe_fsq_out_ptr   : u64 = uninit @align(8)
+  pub let mut _probe_fsq_out_pitch : u64 = uninit @align(8)
+  pub let mut _probe_fsq_out_dims  : u64 = uninit @align(8)
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.WaveOOO (SVC-CO-04): ProbeFbScanoutQuery::run. Calls kind_fb_scanout_query(cap_id=0, &_probe_fsq_out_ptr, &_probe_fsq_out_pitch, &_probe_fsq_out_dims) (external symbol, src/fb_scanout_cap.pdx). Asserts rax==1 (FBS_RESULT_WEAK_STUB) exactly -- deterministic in this probe context since cap_id=0 never resolves to a live descriptor here (src/fb_scanout_cap.pdx's own header: the only possible outcome today), unlike probe_fb_scanout_cap.pdx's (#8) looser `rax<=1` bound which also tolerates a hypothetical live-descriptor future. Re-reads _probe_fsq_out_pitch and asserts it equals 7680, and _probe_fsq_out_dims and asserts it equals 1920|(1080<<32) -- the WEAK-stub's canned geometry, written unconditionally regardless of the pointer outcome. Only then emits the fingerprint via sys_write and asserts a non-negative write count. Any assertion failure short-circuits to probe_fsq_fail. No test rN,rN; no and rN,imm64; no byte-register mov. Labels prefixed probe_fsq_.",
+      block: {
+        xor rdi, rdi;                        // cap_id = 0
+        lea rsi, [rip + _probe_fsq_out_ptr];
+        lea rdx, [rip + _probe_fsq_out_pitch];
+        lea rcx, [rip + _probe_fsq_out_dims];
+        call kind_fb_scanout_query;
+        cmp rax, 1;
+        jne probe_fsq_fail;                  // FBS_RESULT_WEAK_STUB, deterministic here
+
+        lea r10, [rip + _probe_fsq_out_pitch];
+        mov rax, [r10 + 0];
+        cmp rax, 7680;
+        jne probe_fsq_fail;
+
+        lea r10, [rip + _probe_fsq_out_dims];
+        mov rax, [r10 + 0];
+        mov r8, 1080;
+        shl r8, 32;
+        mov r9, 1920;
+        or  r9, r8;
+        cmp rax, r9;
+        jne probe_fsq_fail;
+
+        mov rdi, 1;
+        lea rsi, [rip + probe_fsq_fp];
+        mov rdx, 35;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_fsq_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_fsq_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}

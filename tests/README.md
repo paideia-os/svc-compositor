@@ -47,6 +47,11 @@ that repo) uses for its own still-stubbed timeout path.
 | `probe_query.pdx`             | `svc-compositor query ok\n`              | 24    | #10   |
 | `probe_screenshot.pdx`        | `svc-compositor screenshot ok\n`         | 29    | #11   |
 | `probe_input_pump.pdx`        | `svc-compositor input-pump ok\n`         | 29    | #9    |
+| `probe_scanout_roundtrip.pdx` | `svc-compositor scanout-roundtrip ok\n`  | 36    | Wave OOO |
+| `probe_render_loop_cadence.pdx` | `svc-compositor render-loop-cadence ok\n` | 38  | Wave OOO |
+| `probe_commit_message_decode.pdx` | `svc-compositor commit-message-decode ok\n` | 40 | Wave OOO |
+| `probe_fb_scanout_query.pdx`  | `svc-compositor fb-scanout-query ok\n`   | 35    | Wave OOO |
+| `probe_input_pump_end_to_end.pdx` | `svc-compositor input-pump-e2e ok\n` | 33    | Wave OOO |
 
 ## Return-code convention (org-wide)
 

@@ -1,0 +1,73 @@
+// tests/probe_render_loop_cadence.pdx -- svc-compositor v1.4.0 (Wave
+// OOO: SVC-CO-02)
+// ProbeRenderLoopCadence: real-body 60 Hz cadence witness for
+// RenderLoop::render_loop_run. Unlike tests/probe_render_loop.pdx
+// (#6), which calls render_loop_tick directly (skipping
+// render_loop_init on purpose so the busy-wait exits immediately
+// against the .bss zero baseline, avoiding a real ~16.6 ms spin in a
+// boot smoke), this probe deliberately drives render_loop_run(10) --
+// which DOES call render_loop_init first -- so every one of the 10
+// ticks' render_loop_wait_frame busy-waits for a REAL frame period.
+// It brackets that call with two real sys_clock_read_ns (sysno 66)
+// reads (this repo's "sys_clock_ticks" equivalent -- render_loop.pdx
+// has no separate tick-count syscall of its own; the monotonic
+// nanosecond clock IS the cadence source every tick measures against,
+// per render_loop.pdx's own file header) and asserts the elapsed
+// wall-clock delta lands within +/-5ms of 10 * 16_666_666 ns.
+//
+// paideia-as encoder notes: identical fingerprint syscall shape to
+// tests/boot_r102_first_pixel.pdx; labels prefixed `probe_rlc_`.
+
+module ProbeRenderLoopCadence = structure {
+
+  pub let probe_rlc_fp     : [u8; 39] = "svc-compositor render-loop-cadence ok\n\0"
+  pub let probe_rlc_fp_len : u64      = 38
+
+  pub let run : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "svc-compositor.WaveOOO (SVC-CO-02): ProbeRenderLoopCadence::run. rax=66 (sys_clock_read_ns); syscall -> r12 = t_start (callee-save, survives the nested render_loop_run call per SysV). rdi=10; call render_loop_run (external symbol, src/render_loop.pdx) -- this calls render_loop_init once (seeding _rl_last_tick_ns from a fresh clock read) then render_loop_tick 10 times, each of which busy-waits render_loop_wait_frame to a REAL >=16_666_666 ns period (unlike probe_render_loop.pdx's #6 witness, which skips init specifically to avoid this real wait); asserts the returned tick count == 10. rax=66; syscall -> r13 = t_end. delta = r13 - r12 (monotonic clock, always non-negative, no signed handling needed). expected = 10 * 16_666_666 = 166_666_660 (literal product, not computed via imul-by-immediate -- precomputed at write time per encoder discipline against 2-op imul-with-immediate). tolerance = 5_000_000 ns (5 ms, per SVC-CO-02's acceptance window). Asserts lower<=delta<=upper via two staged-literal unsigned compares (`mov r10,imm; cmp delta,r10`) -- delta is architecturally guaranteed >= expected (each tick's busy-wait never returns early) so the lower bound only guards against a future regression that shortens the wait, and the upper bound catches unbounded scheduling/overhead blowup. Only after both bounds hold does it emit the fingerprint via sys_write. r12/r13 (callee-save) are the only registers required to survive the one nested call; no push is needed beyond what SysV already guarantees the callee preserves. No test rN,rN; no and rN,imm64; no byte-register mov. Labels prefixed probe_rlc_.",
+      block: {
+        mov rax, 66;                         // sys_clock_read_ns
+        syscall;
+        mov r12, rax;                        // r12 = t_start
+
+        mov rdi, 10;                         // n_ticks
+        call render_loop_run;
+        cmp rax, 10;
+        jne probe_rlc_fail;
+
+        mov rax, 66;
+        syscall;
+        mov r13, rax;                        // r13 = t_end
+
+        mov rax, r13;
+        sub rax, r12;                        // rax = delta (t_end - t_start)
+
+        mov r10, 161666660;                  // lower = 166_666_660 - 5_000_000
+        cmp rax, r10;
+        jb  probe_rlc_fail;
+
+        mov r10, 171666660;                  // upper = 166_666_660 + 5_000_000
+        cmp rax, r10;
+        ja  probe_rlc_fail;
+
+        mov rdi, 1;
+        lea rsi, [rip + probe_rlc_fp];
+        mov rdx, 38;
+        mov rax, 1;
+        syscall;
+
+        cmp rax, 0;
+        jl probe_rlc_fail;
+
+        xor rax, rax;
+        ret;
+
+      probe_rlc_fail:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+}
